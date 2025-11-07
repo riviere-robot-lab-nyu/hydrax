@@ -1,0 +1,25 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<mujoco model="walker_scene">
+  <!-- Model that includes the walker along with scene details. -->
+  <include file="walker.xml"/>
+
+  <statistic center="1 0 0.8" extent="3"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="70" elevation="-10"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 3" dir="0 0 -1" directional="false"/>
+    <geom name="floor" size="0 0 .125" type="plane" material="groundplane" conaffinity="1"/>
+  <body name="cube_body0" pos="0.93740235648782 0.06093690306922983 0.06793777871179954"><geom name="cube0" type="box" size="0.13587555742359908 0.13587555742359908 0.13587555742359908" rgba="0.8 0.2 0.2 1" contype="1" conaffinity="1"/></body><body name="cube_body1" pos="1.964922765719454 0.06124151692174867 0.1387978737257749"><geom name="cube1" type="box" size="0.2775957474515498 0.2775957474515498 0.2775957474515498" rgba="0.8 0.2 0.2 1" contype="1" conaffinity="1"/></body><body name="cube_body2" pos="2.4872960850104686 0.15493871109209184 0.0790585194246595"><geom name="cube2" type="box" size="0.158117038849319 0.158117038849319 0.158117038849319" rgba="0.8 0.2 0.2 1" contype="1" conaffinity="1"/></body><body name="cube_body3" pos="3.2927793373288035 -0.15454554287214783 0.15192267918261676"><geom name="cube3" type="box" size="0.3038453583652335 0.3038453583652335 0.3038453583652335" rgba="0.8 0.2 0.2 1" contype="1" conaffinity="1"/></body><body name="cube_body4" pos="4.162897344154688 0.07501787673875049 0.11597438811098583"><geom name="cube4" type="box" size="0.23194877622197166 0.23194877622197166 0.23194877622197166" rgba="0.8 0.2 0.2 1" contype="1" conaffinity="1"/></body><body name="cube_body5" pos="4.774722246018137 -0.01161850125070893 0.19659957479510898"><geom name="cube5" type="box" size="0.39319914959021796 0.39319914959021796 0.39319914959021796" rgba="0.8 0.2 0.2 1" contype="1" conaffinity="1"/></body><body name="cube_body6" pos="5.539670006989356 -0.16875803561112468 0.13192761036370146"><geom name="cube6" type="box" size="0.2638552207274029 0.2638552207274029 0.2638552207274029" rgba="0.8 0.2 0.2 1" contype="1" conaffinity="1"/></body><body name="cube_body7" pos="6.6567409246274725 -0.17932423688181234 0.11885821074140919"><geom name="cube7" type="box" size="0.23771642148281838 0.23771642148281838 0.23771642148281838" rgba="0.8 0.2 0.2 1" contype="1" conaffinity="1"/></body><body name="cube_body8" pos="7.244867628044258 -0.06931093348185496 0.07398094304814762"><geom name="cube8" type="box" size="0.14796188609629524 0.14796188609629524 0.14796188609629524" rgba="0.8 0.2 0.2 1" contype="1" conaffinity="1"/></body><body name="cube_body9" pos="8.001381444279886 -0.08638183437086969 0.1853376199403169"><geom name="cube9" type="box" size="0.3706752398806338 0.3706752398806338 0.3706752398806338" rgba="0.8 0.2 0.2 1" contype="1" conaffinity="1"/></body></worldbody>
+
+</mujoco>

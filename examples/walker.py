@@ -25,7 +25,7 @@ subparsers.add_parser("mppi", help="Model Predictive Path Integral Control")
 args = parser.parse_args()
 
 # Set the controller based on command-line arguments
-if args.algorithm == "ps" or args.algorithm is None:
+if args.algorithm == "ps":# or args.algorithm is None:
     print("Running predictive sampling")
     ctrl = PredictiveSampling(
         task,
@@ -35,15 +35,15 @@ if args.algorithm == "ps" or args.algorithm is None:
         spline_type="zero",
         num_knots=5,
     )
-elif args.algorithm == "mppi":
+elif args.algorithm == "mppi" or args.algorithm is None:
     print("Running MPPI")
     ctrl = MPPI(
         task,
         num_samples=128,
-        noise_level=0.5,
-        temperature=0.1,
+        noise_level=0.5+0.3,
+        temperature=0.1*0.1,
         plan_horizon=0.6,
-        spline_type="zero",
+        spline_type="linear",
         num_knots=5,
     )
 else:
@@ -64,4 +64,5 @@ run_interactive(
     fixed_camera_id=0,
     show_traces=False,
     max_traces=1,
+    record_video=False
 )

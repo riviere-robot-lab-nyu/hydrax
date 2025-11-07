@@ -32,7 +32,8 @@ if args.algorithm == "ps" or args.algorithm is None:
         task,
         num_samples=128,
         noise_level=0.3,
-        spline_type="cubic",
+        # spline_type="cubic",
+        spline_type="linear",
         plan_horizon=1.0,
         num_knots=4,
     )
@@ -43,7 +44,8 @@ elif args.algorithm == "mppi":
         num_samples=128,
         noise_level=0.3,
         temperature=0.1,
-        spline_type="cubic",
+        # spline_type="cubic",
+        spline_type="linear",
         plan_horizon=1.0,
         num_knots=4,
     )
@@ -55,7 +57,8 @@ elif args.algorithm == "cem":
         num_elites=3,
         sigma_start=0.5,
         sigma_min=0.1,
-        spline_type="cubic",
+        # spline_type="cubic",
+        spline_type="linear",
         plan_horizon=1.0,
         num_knots=4,
     )

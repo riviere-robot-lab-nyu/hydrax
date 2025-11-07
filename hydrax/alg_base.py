@@ -243,12 +243,13 @@ class SamplingBasedController(ABC):
             The states (stacked) experienced during the rollouts.
             A Trajectory object containing the control, costs, and trace sites.
         """
-
+        # jax.debug.print("CONTROLS: {}", controls)
         def _scan_fn(
             x: mjx.Data, u: jax.Array
         ) -> Tuple[mjx.Data, Tuple[mjx.Data, jax.Array, jax.Array]]:
             """Compute the cost and observation, then advance the state."""
             x = x.replace(ctrl=u)
+            # jax.debug.print("HELLO STATE: {}", x.qpos)
             x = mjx.step(model, x)  # step model + compute site positions
             cost = self.dt * self.task.running_cost(x, u)
             sites = self.task.get_trace_sites(x)
