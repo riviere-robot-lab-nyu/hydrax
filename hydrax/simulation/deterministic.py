@@ -84,26 +84,31 @@ def run_interactive(  # noqa: PLR0912, PLR0915
 
     # Initialize the controller
     mjx_data = mjx.put_data(mj_model, mj_data)
-    print(mjx_data.qpos)
+    # print(mjx_data.qpos)
     mjx_data = mjx_data.replace(
         mocap_pos=mj_data.mocap_pos, mocap_quat=mj_data.mocap_quat
     )
-    print(mjx_data.qpos)
+    # print(mjx_data.qpos)
     policy_params = controller.init_params(initial_knots=initial_knots)
+    
+    # print("befrore optimizing: ")
+    # print(policy_params.mean)
+    p_test, roll_test = controller.optimize(mjx_data, policy_params)
+    # print("testing1")
+
     # print("testing0")
-    print(mjx_data.qpos)
+    # print(mjx_data.qpos)
     # print(policy_params.mean)
     jit_optimize = jax.jit(controller.optimize)
     jit_interp_func = jax.jit(controller.interp_func)
-    # p_test, roll_test = controller.optimize(mjx_data, policy_params)
-    # print("testing1")
+    
     # print(p_test.mean)
     # Warm-up the controller
     print("Jitting the controller...")
     st = time.time()
     policy_params, rollouts = jit_optimize(mjx_data, policy_params)
     policy_params, rollouts = jit_optimize(mjx_data, policy_params)
-    print(mjx_data.qpos)
+    # print(mjx_data.qpos)
     # print("printing")
     # print(policy_params.mean)
     tq = jnp.arange(0, sim_steps_per_replan) * mj_model.opt.timestep
@@ -137,7 +142,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             output_dir=os.path.join(ROOT, "recordings"),
             width=width,
             height=height,
-            fps=actual_frequency,
+            fps=int(1.0/mj_model.opt.timestep),
         )
         # Ensure model visual offscreen buffer is compatible with video recording
         mj_model.vis.global_.offwidth = width
@@ -186,7 +191,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                 mocap_quat=jnp.array(mj_data.mocap_quat),
                 time=mj_data.time,
             )
-            print(mjx_data.qpos)
+            # print("QPOS: ", mjx_data.qpos)
             # Do a replanning step
             plan_start = time.time()
             policy_params, rollouts = jit_optimize(mjx_data, policy_params)
@@ -231,14 +236,14 @@ def run_interactive(  # noqa: PLR0912, PLR0915
 
             tq = jnp.arange(0, sim_steps_per_replan) * sim_dt + t_curr
             tk = policy_params.tk
-            print("tk", tk)
+            # print("tk", tk)
             knots = policy_params.mean[None, ...]
-            print("knots: ", knots)
-            print("tq", tq)
+            # print("knots: ", knots)
+            # print("tq", tq)
             us = np.asarray(jit_interp_func(tq, tk, knots))[0]  # (ss, nu)
             # print(us)
-            # if bang_bang:
-            #     us = jnp.where(us >= controller.task.threshold, controller.task.u_on, controller.task.u_off)
+            if bang_bang:
+                us = jnp.where(us >= controller.task.threshold, controller.task.u_on, controller.task.u_off)
             # print("us: ", us)
             # simulate the system between spline replanning steps
             for i in range(sim_steps_per_replan):

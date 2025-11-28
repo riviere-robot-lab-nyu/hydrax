@@ -64,5 +64,5 @@ run_interactive(
     fixed_camera_id=0,
     show_traces=False,
     max_traces=1,
-    record_video=False
+    record_video=True
 )

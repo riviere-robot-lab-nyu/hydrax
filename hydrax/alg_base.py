@@ -251,6 +251,7 @@ class SamplingBasedController(ABC):
             x = x.replace(ctrl=u)
             # jax.debug.print("HELLO STATE: {}", x.qpos)
             x = mjx.step(model, x)  # step model + compute site positions
+            # jax.debug.print("STATES: {}",x.qpos)
             cost = self.dt * self.task.running_cost(x, u)
             sites = self.task.get_trace_sites(x)
             return x, (x, cost, sites)

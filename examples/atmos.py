@@ -7,29 +7,30 @@ import jax.numpy as jnp
 
 task = Atmos()
 
-# ctrl = MPPI_bangbang(
-#     task,
-#     num_samples=128,
-#     noise_level=0.3,
-#     plan_horizon=0.6,
-#     num_knots=5,
-#     temperature=0.1,
-# )
-
-ctrl = MPPI(
+ctrl = MPPI_bangbang(
     task,
-    num_samples=128,
-    noise_level=0.1,
-    plan_horizon=0.6,
-    num_knots=4,
-    temperature=0.5,
-    spline_type="zero",
+    num_samples=256,
+    noise_level=0.2,
+    plan_horizon=0.8,
+    num_knots=8,
+    temperature=0.1,
 )
+
+# ctrl = MPPI(
+#     task,
+#     num_samples=256,
+#     noise_level=0.2,
+#     plan_horizon=0.8,
+#     num_knots=8,
+#     temperature=0.1,
+#     spline_type="zero",
+# )
 mj_model = task.mj_model
 mj_model.opt.timestep=0.005
 mj_model.opt.iterations=50
 mj_data = mujoco.MjData(mj_model)
 print(mj_data.qpos)
+print(mj_data.qvel)
 # print(task.u_off)
 # print(task.u_on)
 # print(task.threshold)
@@ -39,11 +40,11 @@ run_interactive(
     mj_model,
     mj_data,
     frequency=50,
-    fixed_camera_id=0,
     show_traces=False,
+    # fixed_camera_id=0,
     max_traces=1,
     record_video=False,
-    bang_bang=False,)
-    # initial_knots=0.5*jnp.ones((5,8),dtype=float)
-# )
+    bang_bang=True,
+    initial_knots=0.5*jnp.ones((8,8),dtype=float)
+)
 
