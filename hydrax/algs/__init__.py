@@ -2,6 +2,7 @@ from .cem import CEM
 from .evosax import Evosax
 from .mppi import MPPI
 from .mppi import MPPI_bangbang
+from .mppi import MPPI_ctrl_chunk
 from .predictive_sampling import PredictiveSampling
 from .dial import DIAL
 

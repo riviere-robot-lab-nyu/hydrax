@@ -34,6 +34,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     reference_fps: float = 30.0,
     record_video: bool = False,
     bang_bang: bool = False,
+    chunking: bool = False
 ) -> None:
     """Run an interactive simulation with the MPC controller.
 
@@ -88,6 +89,11 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     mjx_data = mjx_data.replace(
         mocap_pos=mj_data.mocap_pos, mocap_quat=mj_data.mocap_quat
     )
+
+#     mjx_data = jax.tree.map(
+#     lambda x: x.astype(jnp.int64) if x.dtype == jnp.int32 else x, 
+#     mjx_data
+# )
     # print(mjx_data.qpos)
     policy_params = controller.init_params(initial_knots=initial_knots)
     
@@ -247,7 +253,15 @@ def run_interactive(  # noqa: PLR0912, PLR0915
             # print("us: ", us)
             # simulate the system between spline replanning steps
             for i in range(sim_steps_per_replan):
-                mj_data.ctrl[:] = np.array(us[i])
+                if chunking:
+                    body_u = np.array(us[i])
+                    arm_u = np.zeros(8,)
+                    arm_u[0] = 1.5*np.sin(0.02*mj_data.time)
+                    arm_u[1] = 1.5*np.cos(0.02*mj_data.time)
+                    arm_u[2] = 1.5*np.sin(2*0.002*mj_data.time + 0.5)
+                    mj_data.ctrl[:] = np.hstack([body_u, arm_u])
+                else:
+                    mj_data.ctrl[:] = np.array(us[i])
                 mujoco.mj_step(mj_model, mj_data)
                 viewer.sync()
                 # print(us[i])
