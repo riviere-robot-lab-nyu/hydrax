@@ -123,17 +123,27 @@ class SamplingBasedController(ABC):
                 {key: 0 for key in randomizations.keys()}
             )
 
-    def optimize(self, state: mjx.Data, params: Any) -> Tuple[Any, Trajectory]:
+    def optimize(
+        self,
+        state: mjx.Data,
+        params: Any,
+        integral_init: jax.Array = None,
+    ) -> Tuple[Any, Trajectory]:
         """Perform an optimization step to update the policy parameters.
 
         Args:
             state: The initial state x₀.
             params: The current policy parameters, U ~ π(params).
+            integral_init: Initial integral state for rollouts, shape (integral_dim,).
+                           Defaults to zeros. Pass the real accumulated integral so
+                           rollouts start from the same controller state as the plant.
 
         Returns:
             Updated policy parameters
             Rollouts used to update the parameters
         """
+        if integral_init is None:
+            integral_init = jnp.zeros(1)
         # Warm-start spline by advancing knot times by sim dt, then recomputing
         # the mean knots by evaluating the old spline at those times
         tk = params.tk
@@ -154,7 +164,7 @@ class SamplingBasedController(ABC):
             # combining costs using self.risk_strategy.
             rng, dr_rng = jax.random.split(params.rng)
             rollouts = self.rollout_with_randomizations(
-                state, new_tk, knots, dr_rng
+                state, new_tk, knots, dr_rng, integral_init
             )
             params = params.replace(rng=rng)
 
@@ -177,6 +187,7 @@ class SamplingBasedController(ABC):
         tk: jax.Array,
         knots: jax.Array,
         rng: jax.Array,
+        integral_init: jax.Array,
     ) -> Trajectory:
         """Compute rollout costs, applying domain randomizations.
 
@@ -185,6 +196,7 @@ class SamplingBasedController(ABC):
             tk: The knot times of the control spline, (num_knots,).
             knots: The control spline knots, (num rollouts, num_knots, nu).
             rng: The random number generator key for randomizing initial states.
+            integral_init: Initial integral state for all rollouts, shape (integral_dim,).
 
         Returns:
             A Trajectory object containing the control, costs, and trace sites.
@@ -210,8 +222,8 @@ class SamplingBasedController(ABC):
         # Apply the control sequences, parallelized over both rollouts and
         # domain randomizations.
         _, rollouts = jax.vmap(
-            self.eval_rollouts, in_axes=(self.randomized_axes, 0, None, None)
-        )(self.model, states, controls, knots)
+            self.eval_rollouts, in_axes=(self.randomized_axes, 0, None, None, None)
+        )(self.model, states, controls, knots, integral_init)
 
         # Combine the costs from different domain randomizations using the
         # specified risk strategy.
@@ -223,13 +235,14 @@ class SamplingBasedController(ABC):
             costs=costs, controls=controls, knots=knots, trace_sites=trace_sites
         )
 
-    @partial(jax.vmap, in_axes=(None, None, None, 0, 0))
+    @partial(jax.vmap, in_axes=(None, None, None, 0, 0, None))
     def eval_rollouts(
         self,
         model: mjx.Model,
         state: mjx.Data,
         controls: jax.Array,
         knots: jax.Array,
+        integral_init: jax.Array,
     ) -> Tuple[mjx.Data, Trajectory]:
         """Rollout control sequences (in parallel) and compute the costs.
 
@@ -238,26 +251,35 @@ class SamplingBasedController(ABC):
             state: The initial state x₀.
             controls: The control sequences, (num rollouts, H, nu).
             knots: The control spline knots, (num rollouts, num_knots, nu).
+            integral_init: Initial integral state, shape (integral_dim,).
 
         Returns:
             The states (stacked) experienced during the rollouts.
             A Trajectory object containing the control, costs, and trace sites.
         """
         # jax.debug.print("CONTROLS: {}", controls)
+
         def _scan_fn(
-            x: mjx.Data, u: jax.Array
-        ) -> Tuple[mjx.Data, Tuple[mjx.Data, jax.Array, jax.Array]]:
+            carry: Tuple[mjx.Data, jax.Array], u: jax.Array
+        ) -> Tuple[Tuple[mjx.Data, jax.Array], Tuple[mjx.Data, jax.Array, jax.Array]]:
             """Compute the cost and observation, then advance the state."""
-            x = x.replace(ctrl=u)
-            # jax.debug.print("HELLO STATE: {}", x.qpos)
+            x, integral = carry
+            # ctrl_transform_with_integral converts sampled u (e.g. velocity
+            # commands) into the actuator command written to data.ctrl, using
+            # the running integral state.  Falls back to ctrl_transform if the
+            # task does not override ctrl_transform_with_integral.
+            actual_ctrl = self.task.ctrl_transform_with_integral(x, u, integral)
+            integral = self.task.update_integral(x, u, integral, actual_ctrl)
+            x = x.replace(ctrl=actual_ctrl)
             x = mjx.step(model, x)  # step model + compute site positions
-            # jax.debug.print("STATES: {}",x.qpos)
+            # running_cost still receives the optimizer's action u, not the
+            # transformed forces, so penalty terms stay in the sampled space.
             cost = self.dt * self.task.running_cost(x, u)
             sites = self.task.get_trace_sites(x)
-            return x, (x, cost, sites)
+            return (x, integral), (x, cost, sites)
 
-        final_state, (states, costs, trace_sites) = jax.lax.scan(
-            _scan_fn, state, controls
+        (final_state, _), (states, costs, trace_sites) = jax.lax.scan(
+            _scan_fn, (state, integral_init), controls
         )
         final_cost = self.task.terminal_cost(final_state)
         final_trace_sites = self.task.get_trace_sites(final_state)

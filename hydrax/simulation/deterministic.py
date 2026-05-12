@@ -13,6 +13,7 @@ from hydrax.alg_base import SamplingBasedController
 from hydrax import ROOT
 from hydrax.utils.video import VideoRecorder
 
+import pandas as pd
 """
 Tools for deterministic (synchronous) simulation, with the simulator and
 controller running one after the other in the same thread.
@@ -34,7 +35,8 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     reference_fps: float = 30.0,
     record_video: bool = False,
     bang_bang: bool = False,
-    chunking: bool = False
+    chunking: bool = False,
+    extra_string=None,
 ) -> None:
     """Run an interactive simulation with the MPC controller.
 
@@ -107,13 +109,18 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     # print(policy_params.mean)
     jit_optimize = jax.jit(controller.optimize)
     jit_interp_func = jax.jit(controller.interp_func)
-    
+    jit_ctrl_transform = jax.jit(controller.task.ctrl_transform_with_integral)
+    jit_update_integral = jax.jit(controller.task.update_integral)
+
+    # Integral state for the real system (persists across replanning steps)
+    integral = jnp.zeros(1)
+
     # print(p_test.mean)
     # Warm-up the controller
     print("Jitting the controller...")
     st = time.time()
-    policy_params, rollouts = jit_optimize(mjx_data, policy_params)
-    policy_params, rollouts = jit_optimize(mjx_data, policy_params)
+    policy_params, rollouts = jit_optimize(mjx_data, policy_params, integral)
+    policy_params, rollouts = jit_optimize(mjx_data, policy_params, integral)
     # print(mjx_data.qpos)
     # print("printing")
     # print(policy_params.mean)
@@ -156,13 +163,31 @@ def run_interactive(  # noqa: PLR0912, PLR0915
         if not recorder.start():
             record_video = False
         renderer = mujoco.Renderer(mj_model, height=height, width=width)
-
+    sim_log_time = []
+    sim_log_qpos = []
+    sim_log_qvel = []
     # Start the simulation
     with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
         if fixed_camera_id is not None:
             # Set the custom camera
             viewer.cam.fixedcamid = fixed_camera_id
             viewer.cam.type = 2
+        viewer.user_scn.ngeom += 1
+        mujoco.mjv_initGeom(
+            viewer.user_scn.geoms[viewer.user_scn.ngeom - 1],
+            type=mujoco.mjtGeom.mjGEOM_SPHERE,
+            size=[0.3, 0, 0],
+            pos=[4.0, 3.0, 0.], # Your target coordinates
+            mat=np.eye(3).flatten(),
+            rgba=[0, 1, 0, 1])    # Red color
+        
+        # mujoco.mjv_initGeom(
+        #     viewer.user_scn.geoms[viewer.user_scn.ngeom - 1],
+        #     type=mujoco.mjtGeom.mjGEOM_SPHERE,
+        #     size=[0.3, 0, 0],
+        #     pos=[1.5, 1.5, 0.0], # Your target coordinates
+        #     mat=np.eye(3).flatten(),
+        #     rgba=[0, 1, 0, 1] )   # Red color
 
         # Set up rollout traces
         if show_traces:
@@ -198,9 +223,9 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                 time=mj_data.time,
             )
             # print("QPOS: ", mjx_data.qpos)
-            # Do a replanning step
+            # Do a replanning step (seed rollouts from the real integral state)
             plan_start = time.time()
-            policy_params, rollouts = jit_optimize(mjx_data, policy_params)
+            policy_params, rollouts = jit_optimize(mjx_data, policy_params, integral)
             plan_time = time.time() - plan_start
 
             # Visualize the rollouts
@@ -252,18 +277,45 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                 us = jnp.where(us >= controller.task.threshold, controller.task.u_on, controller.task.u_off)
             # print("us: ", us)
             # simulate the system between spline replanning steps
+            # us[:18] = 0.0
             for i in range(sim_steps_per_replan):
                 if chunking:
-                    body_u = np.array(us[i])
+                    body_u = 0*np.array(us[i][:18])
                     arm_u = np.zeros(8,)
-                    arm_u[0] = 1.5*np.sin(0.02*mj_data.time)
-                    arm_u[1] = 1.5*np.cos(0.02*mj_data.time)
-                    arm_u[2] = 1.5*np.sin(2*0.002*mj_data.time + 0.5)
+                    # print(mj_data.time)
+                    arm_u[0] = 1.5*np.sin(0.2*mj_data.time)
+                    arm_u[1] = 1.5*np.cos(0.2*mj_data.time)
+                    arm_u[2] = 1.5*np.sin(2*0.2*mj_data.time + 0.5)
                     mj_data.ctrl[:] = np.hstack([body_u, arm_u])
                 else:
-                    mj_data.ctrl[:] = np.array(us[i])
+                    # Update mjx_data with the current physical state so
+                    # ctrl_transform_with_integral sees the real qpos/qvel.
+                    mjx_data = mjx_data.replace(
+                        qpos=jnp.array(mj_data.qpos),
+                        qvel=jnp.array(mj_data.qvel),
+                    )
+                    #print("us:", us[i])
+                    actual_ctrl = jit_ctrl_transform(
+                        mjx_data, jnp.array(us[i]), integral
+                    )
+                    #print("actual ctrl:", actual_ctrl)
+                    integral = jit_update_integral(
+                        mjx_data, jnp.array(us[i]), integral, actual_ctrl
+                    )
+                    mj_data.ctrl[:] = np.array(actual_ctrl)
                 mujoco.mj_step(mj_model, mj_data)
-                viewer.sync()
+                if not chunking:
+                    mjx_data = mjx_data.replace(
+                        qpos=jnp.array(mj_data.qpos),
+                        qvel=jnp.array(mj_data.qvel),
+                    )
+
+                sim_log_time.append(mj_data.time)
+                sim_log_qpos.append(mj_data.qpos.copy()) # .copy() is crucial for numpy arrays
+                sim_log_qvel.append(mj_data.qvel.copy())
+
+
+                #viewer.sync()
                 # print(us[i])
                 # Capture frame if recording
                 if record_video and recorder.is_recording:
@@ -271,6 +323,7 @@ def run_interactive(  # noqa: PLR0912, PLR0915
                     frame = renderer.render()
                     recorder.add_frame(frame.tobytes())
 
+            viewer.sync()
             # Try to run in roughly realtime
             elapsed = time.time() - start_time
             if elapsed < step_dt:
@@ -289,3 +342,26 @@ def run_interactive(  # noqa: PLR0912, PLR0915
     # Close the video recorder if recording was enabled
     if record_video and recorder is not None:
         recorder.stop()
+
+    print("Processing simulation data...")
+
+    # Convert lists to numpy arrays
+    t_data = np.array(sim_log_time)
+    q_data = np.array(sim_log_qpos)
+    v_data = np.array(sim_log_qvel)
+
+    # Create column names
+    q_cols = [f"qpos_{i}" for i in range(q_data.shape[1])]
+    v_cols = [f"qvel_{i}" for i in range(v_data.shape[1])]
+    
+    # Combine into a single matrix: [time, qpos, qvel]
+    all_data = np.hstack([t_data[:, None], q_data, v_data])
+    all_cols = ["time"] + q_cols + v_cols
+
+    # Create DataFrame and save
+    df = pd.DataFrame(all_data, columns=all_cols)
+    output_path = "simulation_log.xlsx"
+    df.to_excel(output_path, index=False)
+    print(f"Data saved successfully to {os.path.abspath(output_path)}")
+
+# <--- END ADDED

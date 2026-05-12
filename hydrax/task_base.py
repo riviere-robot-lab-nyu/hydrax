@@ -97,6 +97,68 @@ class Task(ABC):
 
         return state.site_xpos[self.trace_site_ids]
 
+    def ctrl_transform(self, state: mjx.Data, ctrl: jax.Array) -> jax.Array:
+        """Transform sampled controls into actuator commands before the physics step.
+
+        Override this in a Task subclass to implement a deterministic inner control
+        law so that the optimizer samples in a different space (e.g. velocity
+        commands) while the physics simulation still receives forces/torques.
+
+        The default implementation is the identity: ctrl passes through unchanged.
+
+        Args:
+            state: The current simulation state xₜ (qpos, qvel, etc.).
+            ctrl:  The raw control action sampled by the optimizer.
+
+        Returns:
+            The actuator command array written to mjx.Data.ctrl before mjx.step.
+        """
+        return ctrl
+
+    def ctrl_transform_with_integral(
+        self, state: mjx.Data, ctrl: jax.Array, integral: jax.Array
+    ) -> jax.Array:
+        """Like ctrl_transform but also receives the running integral state.
+
+        Override this (instead of ctrl_transform) when the inner control law
+        needs integral feedback (e.g. a PI velocity controller).  The integral
+        is carried through the rollout scan so each simulated step sees the
+        correctly accumulated value.
+
+        The default implementation ignores the integral and delegates to
+        ctrl_transform, so existing subclasses require no changes.
+
+        Args:
+            state:    The current simulation state xₜ.
+            ctrl:     The raw control action sampled by the optimizer.
+            integral: Running integral state, shape (integral_dim,).
+
+        Returns:
+            The actuator command array written to mjx.Data.ctrl before mjx.step.
+        """
+        return self.ctrl_transform(state, ctrl)
+
+    def update_integral(
+        self,
+        _state: mjx.Data,
+        _ctrl: jax.Array,
+        integral: jax.Array,
+        _actual_ctrl: jax.Array = None,
+    ) -> jax.Array:
+        """Update the integral state after ctrl_transform but before mjx.step.
+
+        Args:
+            _state:       Current simulation state xₜ.
+            _ctrl:        Raw optimizer action uₜ (optimizer space).
+            integral:     Current integral state, shape (integral_dim,).
+            _actual_ctrl: Actuator command produced by ctrl_transform_with_integral.
+                          Use this to detect saturation for anti-windup.
+
+        Returns:
+            Updated integral state, same shape as integral.
+        """
+        return integral
+
     def domain_randomize_model(self, rng: jax.Array) -> Dict[str, jax.Array]:
         """Generate randomized model parameters for domain randomization.
 

@@ -129,6 +129,43 @@ For the cost, simply implement the `running_cost` ($\ell$) and `terminal_cost`
 
 See [`hydrax.tasks`](hydrax/tasks) for some example task implementations.
 
+### Inner-loop control with integral feedback
+
+For tasks where the optimizer samples in a different space than the actuator
+commands (e.g. velocity commands → forces), you can override `ctrl_transform`
+to implement a deterministic inner-loop control law. Hydrax calls this once per
+rollout step before passing the result to `mjx.step`.
+
+When an integral term is needed (e.g. a PI yaw-rate controller), override
+`ctrl_transform_with_integral` and `update_integral` instead:
+
+```python
+class MyTask(Task):
+
+    def ctrl_transform_with_integral(
+        self, state: mjx.Data, ctrl: jax.Array, integral: jax.Array
+    ) -> jax.Array:
+        # Use integral[0] (or more elements) in your control law.
+        torque = self.kp * (ctrl[0] - state.qvel[0]) + self.ki * integral[0]
+        return jnp.array([torque])
+
+    def update_integral(
+        self, state: mjx.Data, ctrl: jax.Array, integral: jax.Array
+    ) -> jax.Array:
+        # Implement your integration rule here; return shape (integral_dim,).
+        yaw_err = ctrl[2] - state.qvel[2]
+        return integral + self.dt * yaw_err
+```
+
+The `integral` array (shape `(1,)` by default, larger if needed) is carried
+through the rollout scan so each simulated step sees the correctly accumulated
+value. All rollouts in a planning window start from `jnp.zeros(1)`; to warm-
+start from the real-world integral, update `integral_init` in the scan (see
+[`alg_base.py`](hydrax/alg_base.py)).
+
+Tasks that only override `ctrl_transform` are unaffected — the default
+`ctrl_transform_with_integral` simply delegates to `ctrl_transform`.
+
 ## Implement your own control algorithm
 
 Hydrax considers sampling-based MPC algorithms that follow the following

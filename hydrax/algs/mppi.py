@@ -157,6 +157,7 @@ class MPPI_ctrl_chunk(SamplingBasedController):
         tk: jax.Array,
         knots: jax.Array,
         rng: jax.Array,
+        integral_init: jax.Array = None,
     ) -> Trajectory:
         """Compute rollout costs, applying domain randomizations.
 
@@ -240,13 +241,14 @@ class MPPI_bangbang(SamplingBasedController):
         _params = super().init_params(initial_knots, seed)
         return MPPIParams(tk=_params.tk, mean=_params.mean, rng=_params.rng)
 
-    @partial(jax.vmap, in_axes=(None, None, None, 0, 0))
+    @partial(jax.vmap, in_axes=(None, None, None, 0, 0, None))
     def eval_rollouts(
         self,
         model: mjx.Model,
         state: mjx.Data,
         controls: jax.Array,
         knots: jax.Array,
+        integral_init: jax.Array,
     ) -> Tuple[mjx.Data, Trajectory]:
         
         def _scan_fn(
