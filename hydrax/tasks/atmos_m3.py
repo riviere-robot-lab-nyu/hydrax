@@ -83,7 +83,7 @@ class AtmosM3(Task):
 
     def __init__(
         self,
-        goal: jax.Array = jnp.array([4.0, 3.0, 0.0, 0.0, 0.0, 0.0]),
+        goal: jax.Array = jnp.array([0.1, 0.3, 0*0.78530, 0.0, 0.0, 0.0]),
         state_cost: jax.Array = jnp.array([1000.0, 1000.0, 500.0, 1000.0, 1000.0, 20.0]),
         ctrl_cost: jax.Array = jnp.zeros(3),
         arm_ctrl_cost: jax.Array = jnp.zeros(6),
@@ -113,8 +113,8 @@ class AtmosM3(Task):
         self.arm_mode = arm_mode
 
         # u_min/u_max define what the optimizer samples — not forces/torques.
-        base_min = jnp.array([-2.0, -2.0, -1.0])
-        base_max = jnp.array([ 2.0,  2.0,  1.0])
+        base_min = jnp.array([-.3, -.3, -.4])
+        base_max = jnp.array([ .3,  .3,  .4])
 
         if arm_mode == "absolute":
             arm_min, arm_max = _ARM_JOINT_MIN, _ARM_JOINT_MAX
@@ -225,6 +225,8 @@ class AtmosM3(Task):
             state.qvel[:3] - self.goal[3:],
         ])
 
+    #def running_cost(self, state: mjx.Data, control: jax.Array) -> jax.Array:
+        #return self._circle_cost(state) + 0.1*jnp.sum(jnp.square(control[:3])) + jnp.sum(self.R_arm * jnp.square(control[3:9])) + 100*jnp.sum(jnp.square(state.qpos[3:9]))
     def running_cost(self, state: mjx.Data, control: jax.Array) -> jax.Array:
         err = self._base_state_err(state)
         base_state = jnp.sum(self.Q   * jnp.square(err))
@@ -232,6 +234,16 @@ class AtmosM3(Task):
         arm_ctrl   = jnp.sum(self.R_arm * jnp.square(control[3:9]))
         arm_ctrl = arm_ctrl + jnp.sum(jnp.square(100. * state.qpos[3:9]))
         return base_state + base_ctrl + arm_ctrl
+    
+    def _circle_cost(self, state: mjx.Data, radius: float=5.0, period: float = 45.0) -> jax.Array:
+        B = 2*jnp.pi/period
+        x_des = radius * jnp.cos(B*state.time) - radius
+        y_des = radius * jnp.sin(B*state.time)
+        x_des_dot = -radius * B * jnp.sin(B*state.time)
+        y_des_dot = B*radius * jnp.cos(B*state.time)
+        return 10*((state.qpos[0]-x_des)**2 + (state.qpos[1] - y_des)**2 + (state.qvel[0]-x_des_dot)**2 + (state.qvel[1] - y_des_dot)**2)
+        
 
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
         return 10.0 * jnp.sum(self.Q * jnp.square(self._base_state_err(state))) * self.dt
+        #return 10*self._circle_cost(state)

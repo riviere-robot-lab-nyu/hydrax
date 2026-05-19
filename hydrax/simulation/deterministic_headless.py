@@ -1,0 +1,641 @@
+import time
+from typing import Sequence
+import os
+
+import jax
+import jax.numpy as jnp
+import mujoco
+import mujoco.viewer
+import numpy as np
+from mujoco import mjx
+
+from hydrax.alg_base import SamplingBasedController
+from hydrax import ROOT
+from hydrax.utils.video import VideoRecorder
+
+import pandas as pd
+"""
+Tools for deterministic (synchronous) simulation, with the simulator and
+controller running one after the other in the same thread.
+"""
+
+
+def run_interactive(  # noqa: PLR0912, PLR0915
+    controller: SamplingBasedController,
+    mj_model: mujoco.MjModel,
+    mj_data: mujoco.MjData,
+    frequency: float,
+    initial_knots: jax.Array = None,
+    fixed_camera_id: int = None,
+    show_traces: bool = True,
+    max_traces: int = 5,
+    trace_width: float = 5.0,
+    trace_color: Sequence = [1.0, 1.0, 1.0, 0.1],
+    reference: np.ndarray = None,
+    reference_fps: float = 30.0,
+    record_video: bool = False,
+    bang_bang: bool = False,
+    chunking: bool = False,
+    extra_string=None,
+) -> None:
+    """Run an interactive simulation with the MPC controller.
+
+    This is a deterministic simulation, with the controller and simulation
+    running in the same thread. This is useful for repeatability, but is less
+    realistic than asynchronous simulation.
+
+    Note: the actual control frequency may be slightly different than what is
+    requested, because the control period must be an integer multiple of the
+    simulation time step.
+
+    Args:
+        controller: The controller instance, which includes the task
+                    (e.g., model, cost) definition.
+        mj_model: The MuJoCo model for the system to use for simulation. Could
+                  be slightly different from the model used by the controller.
+        mj_data: A MuJoCo data object containing the initial system state.
+        frequency: The requested control frequency (Hz) for replanning.
+        initial_knots: The initial knot points for the control spline at t=0
+        fixed_camera_id: The camera ID to use for the fixed camera view.
+        show_traces: Whether to show traces for the site positions.
+        max_traces: The maximum number of traces to show at once.
+        trace_width: The width of the trace lines (in pixels).
+        trace_color: The RGBA color of the trace lines.
+        reference: The reference trajectory (qs) to visualize.
+        reference_fps: The frame rate of the reference trajectory.
+        record_video: Whether to record a video of the simulation.
+    """
+    # Report the planning horizon in seconds for debugging
+    print(
+        f"Planning with {controller.ctrl_steps} steps "
+        f"over a {controller.plan_horizon} second horizon "
+        f"with {controller.num_knots} knots."
+    )
+
+    # Figure out how many sim steps to run before replanning
+    replan_period = 1.0 / frequency
+    sim_steps_per_replan = int(replan_period / mj_model.opt.timestep)
+    sim_steps_per_replan = max(sim_steps_per_replan, 1)
+
+    # print("sim_steps per replan:", sim_steps_per_replan)
+    step_dt = sim_steps_per_replan * mj_model.opt.timestep
+    actual_frequency = 1.0 / step_dt
+    print(
+        f"Planning at {actual_frequency} Hz, "
+        f"simulating at {1.0 / mj_model.opt.timestep} Hz"
+    )
+
+    # Initialize the controller
+    mjx_data = mjx.put_data(mj_model, mj_data)
+    # print(mjx_data.qpos)
+    mjx_data = mjx_data.replace(
+        mocap_pos=mj_data.mocap_pos, mocap_quat=mj_data.mocap_quat
+    )
+
+#     mjx_data = jax.tree.map(
+#     lambda x: x.astype(jnp.int64) if x.dtype == jnp.int32 else x, 
+#     mjx_data
+# )
+    # print(mjx_data.qpos)
+    policy_params = controller.init_params(initial_knots=initial_knots)
+    
+    # print("befrore optimizing: ")
+    # print(policy_params.mean)
+    p_test, roll_test = controller.optimize(mjx_data, policy_params)
+    # print("testing1")
+
+    # print("testing0")
+    # print(mjx_data.qpos)
+    # print(policy_params.mean)
+    jit_optimize = jax.jit(controller.optimize)
+    jit_interp_func = jax.jit(controller.interp_func)
+    jit_ctrl_transform = jax.jit(controller.task.ctrl_transform_with_integral)
+    jit_update_integral = jax.jit(controller.task.update_integral)
+
+    # Integral state for the real system (persists across replanning steps)
+    integral = jnp.zeros(1)
+
+    # print(p_test.mean)
+    # Warm-up the controller
+    print("Jitting the controller...")
+    st = time.time()
+    policy_params, rollouts = jit_optimize(mjx_data, policy_params, integral)
+    policy_params, rollouts = jit_optimize(mjx_data, policy_params, integral)
+    # print(mjx_data.qpos)
+    # print("printing")
+    # print(policy_params.mean)
+    tq = jnp.arange(0, sim_steps_per_replan) * mj_model.opt.timestep
+    tk = policy_params.tk
+    knots = policy_params.mean[None, ...]
+
+    _ = jit_interp_func(tq, tk, knots)
+    _ = jit_interp_func(tq, tk, knots)
+    print(f"Time to jit: {time.time() - st:.3f} seconds")
+    num_traces = min(rollouts.controls.shape[1], max_traces)
+
+    # Ghost reference setup
+    if reference is not None:
+        ref_data = mujoco.MjData(mj_model)
+        assert reference.shape[1] == mj_model.nq
+        ref_data.qpos[:] = reference[0, :]
+        mujoco.mj_forward(mj_model, ref_data)
+
+        vopt = mujoco.MjvOption()
+        vopt.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = True  # Transparent.
+        pert = mujoco.MjvPerturb()
+        catmask = mujoco.mjtCatBit.mjCAT_DYNAMIC  # only show dynamic bodies
+
+    # Initialize video recording if enabled
+    recorder = None
+    if record_video:
+        # Video dimensions
+        width, height = 720, 480
+        # Create the video recorder
+        recorder = VideoRecorder(
+            output_dir=os.path.join(ROOT, "recordings"),
+            width=width,
+            height=height,
+            fps=int(1.0/mj_model.opt.timestep),
+        )
+        # Ensure model visual offscreen buffer is compatible with video recording
+        mj_model.vis.global_.offwidth = width
+        mj_model.vis.global_.offheight = height
+        if not recorder.start():
+            record_video = False
+        renderer = mujoco.Renderer(mj_model, height=height, width=width)
+    sim_log_time = []
+    sim_log_qpos = []
+    sim_log_qvel = []
+    # Start the simulation
+    with mujoco.viewer.launch_passive(mj_model, mj_data) as viewer:
+        if fixed_camera_id is not None:
+            # Set the custom camera
+            viewer.cam.fixedcamid = fixed_camera_id
+            viewer.cam.type = 2
+        viewer.user_scn.ngeom += 1
+        mujoco.mjv_initGeom(
+            viewer.user_scn.geoms[viewer.user_scn.ngeom - 1],
+            type=mujoco.mjtGeom.mjGEOM_SPHERE,
+            size=[0.3, 0, 0],
+            pos=[4.0, 3.0, 0.], # Your target coordinates
+            mat=np.eye(3).flatten(),
+            rgba=[0, 1, 0, 1])    # Red color
+        
+        # mujoco.mjv_initGeom(
+        #     viewer.user_scn.geoms[viewer.user_scn.ngeom - 1],
+        #     type=mujoco.mjtGeom.mjGEOM_SPHERE,
+        #     size=[0.3, 0, 0],
+        #     pos=[1.5, 1.5, 0.0], # Your target coordinates
+        #     mat=np.eye(3).flatten(),
+        #     rgba=[0, 1, 0, 1] )   # Red color
+
+        # Set up rollout traces
+        if show_traces:
+            num_trace_sites = len(controller.task.trace_site_ids)
+            for i in range(
+                num_trace_sites * num_traces * controller.ctrl_steps
+            ):
+                mujoco.mjv_initGeom(
+                    viewer.user_scn.geoms[i],
+                    type=mujoco.mjtGeom.mjGEOM_LINE,
+                    size=np.zeros(3),
+                    pos=np.zeros(3),
+                    mat=np.eye(3).flatten(),
+                    rgba=np.array(trace_color),
+                )
+                viewer.user_scn.ngeom += 1
+
+        # Add geometry for the ghost reference
+        if reference is not None:
+            mujoco.mjv_addGeoms(
+                mj_model, ref_data, vopt, pert, catmask, viewer.user_scn
+            )
+
+        while viewer.is_running():
+            start_time = time.time()
+
+            # Set the start state for the controller
+            mjx_data = mjx_data.replace(
+                qpos=jnp.array(mj_data.qpos),
+                qvel=jnp.array(mj_data.qvel),
+                mocap_pos=jnp.array(mj_data.mocap_pos),
+                mocap_quat=jnp.array(mj_data.mocap_quat),
+                time=mj_data.time,
+            )
+            # print("QPOS: ", mjx_data.qpos)
+            # Do a replanning step (seed rollouts from the real integral state)
+            plan_start = time.time()
+            policy_params, rollouts = jit_optimize(mjx_data, policy_params, integral)
+            plan_time = time.time() - plan_start
+
+            # Visualize the rollouts
+            if show_traces:
+                ii = 0
+                for k in range(num_trace_sites):
+                    for i in range(num_traces):
+                        for j in range(controller.ctrl_steps):
+                            mujoco.mjv_connector(
+                                viewer.user_scn.geoms[ii],
+                                mujoco.mjtGeom.mjGEOM_LINE,
+                                trace_width,
+                                rollouts.trace_sites[i, j, k],
+                                rollouts.trace_sites[i, j + 1, k],
+                            )
+                            ii += 1
+
+            # Update the ghost reference
+            if reference is not None:
+                t_ref = mj_data.time * reference_fps
+                i_ref = int(t_ref)
+                i_ref = min(i_ref, reference.shape[0] - 1)
+                ref_data.qpos[:] = reference[i_ref]
+                mujoco.mj_forward(mj_model, ref_data)
+                mujoco.mjv_updateScene(
+                    mj_model,
+                    ref_data,
+                    vopt,
+                    pert,
+                    viewer.cam,
+                    catmask,
+                    viewer.user_scn,
+                )
+
+            # query the control spline at the sim frequency
+            # (we assume the sim freq is the same as the low-level ctrl freq)
+            sim_dt = mj_model.opt.timestep
+            t_curr = mj_data.time
+
+            tq = jnp.arange(0, sim_steps_per_replan) * sim_dt + t_curr
+            tk = policy_params.tk
+            # print("tk", tk)
+            knots = policy_params.mean[None, ...]
+            # print("knots: ", knots)
+            # print("tq", tq)
+            us = np.asarray(jit_interp_func(tq, tk, knots))[0]  # (ss, nu)
+            # print(us)
+            if bang_bang:
+                us = jnp.where(us >= controller.task.threshold, controller.task.u_on, controller.task.u_off)
+            # print("us: ", us)
+            # simulate the system between spline replanning steps
+            # us[:18] = 0.0
+            for i in range(sim_steps_per_replan):
+                if chunking:
+                    body_u = 0*np.array(us[i][:18])
+                    arm_u = np.zeros(8,)
+                    # print(mj_data.time)
+                    arm_u[0] = 1.5*np.sin(0.2*mj_data.time)
+                    arm_u[1] = 1.5*np.cos(0.2*mj_data.time)
+                    arm_u[2] = 1.5*np.sin(2*0.2*mj_data.time + 0.5)
+                    mj_data.ctrl[:] = np.hstack([body_u, arm_u])
+                else:
+                    # Update mjx_data with the current physical state so
+                    # ctrl_transform_with_integral sees the real qpos/qvel.
+                    mjx_data = mjx_data.replace(
+                        qpos=jnp.array(mj_data.qpos),
+                        qvel=jnp.array(mj_data.qvel),
+                    )
+                    #print("us:", us[i])
+                    actual_ctrl = jit_ctrl_transform(
+                        mjx_data, jnp.array(us[i]), integral
+                    )
+                    #print("actual ctrl:", actual_ctrl)
+                    integral = jit_update_integral(
+                        mjx_data, jnp.array(us[i]), integral, actual_ctrl
+                    )
+                    mj_data.ctrl[:] = np.array(actual_ctrl)
+                mujoco.mj_step(mj_model, mj_data)
+                if not chunking:
+                    mjx_data = mjx_data.replace(
+                        qpos=jnp.array(mj_data.qpos),
+                        qvel=jnp.array(mj_data.qvel),
+                    )
+
+                sim_log_time.append(mj_data.time)
+                sim_log_qpos.append(mj_data.qpos.copy()) # .copy() is crucial for numpy arrays
+                sim_log_qvel.append(mj_data.qvel.copy())
+
+
+                #viewer.sync()
+                # print(us[i])
+                # Capture frame if recording
+                if record_video and recorder.is_recording:
+                    renderer.update_scene(mj_data, viewer.cam)
+                    frame = renderer.render()
+                    recorder.add_frame(frame.tobytes())
+
+            viewer.sync()
+            # Try to run in roughly realtime
+            elapsed = time.time() - start_time
+            if elapsed < step_dt:
+                time.sleep(step_dt - elapsed)
+
+            # Print some timing information
+            rtr = step_dt / (time.time() - start_time)
+            print(
+                f"Realtime rate: {rtr:.2f}, plan time: {plan_time:.4f}s",
+                end="\r",
+            )
+
+    # Preserve the last printout
+    print("")
+
+    # Close the video recorder if recording was enabled
+    if record_video and recorder is not None:
+        recorder.stop()
+
+    print("Processing simulation data...")
+
+    # Convert lists to numpy arrays
+    t_data = np.array(sim_log_time)
+    q_data = np.array(sim_log_qpos)
+    v_data = np.array(sim_log_qvel)
+
+    # Create column names
+    q_cols = [f"qpos_{i}" for i in range(q_data.shape[1])]
+    v_cols = [f"qvel_{i}" for i in range(v_data.shape[1])]
+    
+    # Combine into a single matrix: [time, qpos, qvel]
+    all_data = np.hstack([t_data[:, None], q_data, v_data])
+    all_cols = ["time"] + q_cols + v_cols
+
+    # Create DataFrame and save
+    df = pd.DataFrame(all_data, columns=all_cols)
+    output_path = "simulation_log.xlsx"
+    df.to_excel(output_path, index=False)
+    print(f"Data saved successfully to {os.path.abspath(output_path)}")
+
+# <--- END ADDED
+
+
+def run_headless(  # noqa: PLR0912, PLR0915
+    controller: SamplingBasedController,
+    mj_model: mujoco.MjModel,
+    mj_data: mujoco.MjData,
+    frequency: float,
+    duration: float,
+    initial_knots: jax.Array = None,
+    fixed_camera_id: int = None,
+    show_traces: bool = True,
+    max_traces: int = 5,
+    trace_width: float = 5.0,
+    trace_color: Sequence = [1.0, 1.0, 1.0, 0.1],
+    reference: np.ndarray = None,
+    reference_fps: float = 30.0,
+    video_fps: float = 30.0,
+    video_width: int = 720,
+    video_height: int = 480,
+    output_dir: str = None,
+    record_video = True,
+    #log_path: str = "simulation_log.xlsx",
+    #bang_bang: bool = False,
+    #chunking: bool = False,
+) -> None:
+    """Run a deterministic simulation headlessly and record an mp4.
+
+    Mirrors `run_interactive` but without `mujoco.viewer.launch_passive`:
+    rendering goes through a `mujoco.Renderer` and frames are piped to ffmpeg
+    via `VideoRecorder`. The loop terminates when `mj_data.time >= duration`.
+
+    Args:
+        controller, mj_model, mj_data, frequency, initial_knots: same as
+            `run_interactive`.
+        duration: How many seconds of simulated time to run before stopping.
+        fixed_camera_id: If set, use this fixed MuJoCo camera; otherwise the
+            default free camera framed on the model.
+        show_traces, max_traces, trace_width, trace_color: rollout trace
+            overlay (drawn into each captured video frame).
+        reference, reference_fps: optional ghost reference trajectory.
+        video_fps, video_width, video_height: output mp4 parameters.
+        output_dir: where to write the mp4 (defaults to `<ROOT>/recordings`).
+        log_path: where to write the per-step qpos/qvel xlsx log.
+        bang_bang, chunking: same as `run_interactive`.
+    """
+    print(
+        f"Planning with {controller.ctrl_steps} steps "
+        f"over a {controller.plan_horizon} second horizon "
+        f"with {controller.num_knots} knots."
+    )
+
+    sim_dt = mj_model.opt.timestep
+    replan_period = 1.0 / frequency
+    sim_steps_per_replan = max(int(replan_period / sim_dt), 1)
+    step_dt = sim_steps_per_replan * sim_dt
+    print(
+        f"Planning at {1.0 / step_dt:.2f} Hz, simulating at {1.0 / sim_dt:.2f} Hz, "
+        f"recording at {video_fps:.1f} fps for {duration:.2f}s."
+    )
+
+    # Controller / mjx setup
+    mjx_data = mjx.put_data(mj_model, mj_data)
+    mjx_data = mjx_data.replace(
+        mocap_pos=mj_data.mocap_pos, mocap_quat=mj_data.mocap_quat
+    )
+    policy_params = controller.init_params(initial_knots=initial_knots)
+
+    jit_optimize = jax.jit(controller.optimize)
+    jit_interp_func = jax.jit(controller.interp_func)
+    jit_ctrl_transform = jax.jit(controller.task.ctrl_transform_with_integral)
+    jit_update_integral = jax.jit(controller.task.update_integral)
+
+    integral = jnp.zeros(1)
+
+    # Warm-up jit
+    print("Jitting the controller...")
+    st = time.time()
+    policy_params, rollouts = jit_optimize(mjx_data, policy_params, integral)
+    policy_params, rollouts = jit_optimize(mjx_data, policy_params, integral)
+    _tq_warm = jnp.arange(0, sim_steps_per_replan) * sim_dt
+    _ = jit_interp_func(_tq_warm, policy_params.tk, policy_params.mean[None, ...])
+    _ = jit_interp_func(_tq_warm, policy_params.tk, policy_params.mean[None, ...])
+    print(f"Time to jit: {time.time() - st:.3f} seconds")
+
+    num_traces = min(rollouts.controls.shape[1], max_traces)
+
+    # Camera
+    cam = mujoco.MjvCamera()
+    if fixed_camera_id is not None:
+        cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+        cam.fixedcamid = fixed_camera_id
+    else:
+        mujoco.mjv_defaultFreeCamera(mj_model, cam)
+
+    # Ghost reference
+    if reference is not None:
+        ref_data = mujoco.MjData(mj_model)
+        assert reference.shape[1] == mj_model.nq
+        ref_data.qpos[:] = reference[0, :]
+        mujoco.mj_forward(mj_model, ref_data)
+        vopt = mujoco.MjvOption()
+        vopt.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = True
+        pert = mujoco.MjvPerturb()
+        catmask = mujoco.mjtCatBit.mjCAT_DYNAMIC
+
+    # Renderer + recorder
+    if record_video:
+        if output_dir is None:
+            output_dir = os.path.join(ROOT, "recordings")
+        mj_model.vis.global_.offwidth = video_width
+        mj_model.vis.global_.offheight = video_height
+        recorder = VideoRecorder(
+            output_dir=output_dir,
+            width=video_width,
+            height=video_height,
+            fps=video_fps,
+        )
+        if not recorder.start():
+            raise RuntimeError(
+                "Failed to start VideoRecorder (is ffmpeg installed?)"
+            )
+        renderer = mujoco.Renderer(mj_model, height=video_height, width=video_width)
+
+    # Frame-capture cadence: one frame every `frame_interval` of sim time
+    frame_interval = 1.0 / video_fps
+    next_capture_time = mj_data.time
+
+    #sim_log_time = []
+    #sim_log_qpos = []
+    #sim_log_qvel = []
+
+    wall_start = time.time()
+    try:
+        while mj_data.time < duration:
+            mjx_data = mjx_data.replace(
+                qpos=jnp.array(mj_data.qpos),
+                qvel=jnp.array(mj_data.qvel),
+                mocap_pos=jnp.array(mj_data.mocap_pos),
+                mocap_quat=jnp.array(mj_data.mocap_quat),
+                time=mj_data.time,
+            )
+
+            plan_start = time.time()
+            policy_params, rollouts = jit_optimize(
+                mjx_data, policy_params, integral
+            )
+            plan_time = time.time() - plan_start
+
+            if reference is not None:
+                t_ref = mj_data.time * reference_fps
+                i_ref = min(int(t_ref), reference.shape[0] - 1)
+                ref_data.qpos[:] = reference[i_ref]
+                mujoco.mj_forward(mj_model, ref_data)
+
+            tq = jnp.arange(0, sim_steps_per_replan) * sim_dt + mj_data.time
+            us = np.asarray(
+                jit_interp_func(
+                    tq, policy_params.tk, policy_params.mean[None, ...]
+                )
+            )[0]
+#            if bang_bang:
+#                us = jnp.where(
+#                    us >= controller.task.threshold,
+#                    controller.task.u_on,
+#                    controller.task.u_off,
+#                )
+
+            for i in range(sim_steps_per_replan):
+#                if chunking:
+#                    body_u = 0 * np.array(us[i][:18])
+#                    arm_u = np.zeros(8)
+#                    arm_u[0] = 1.5 * np.sin(0.2 * mj_data.time)
+#                    arm_u[1] = 1.5 * np.cos(0.2 * mj_data.time)
+#                    arm_u[2] = 1.5 * np.sin(2 * 0.2 * mj_data.time + 0.5)
+#                    mj_data.ctrl[:] = np.hstack([body_u, arm_u])
+#                else:
+                mjx_data = mjx_data.replace(
+                    qpos=jnp.array(mj_data.qpos),
+                    qvel=jnp.array(mj_data.qvel),
+                )
+                actual_ctrl = jit_ctrl_transform(
+                    mjx_data, jnp.array(us[i]), integral
+                )
+                integral = jit_update_integral(
+                    mjx_data, jnp.array(us[i]), integral, actual_ctrl
+                )
+                mj_data.ctrl[:] = np.array(actual_ctrl)
+
+                mujoco.mj_step(mj_model, mj_data)
+
+                #if not chunking:
+                mjx_data = mjx_data.replace(
+                    qpos=jnp.array(mj_data.qpos),
+                    qvel=jnp.array(mj_data.qvel),
+                )
+
+                #sim_log_time.append(mj_data.time)
+                #sim_log_qpos.append(mj_data.qpos.copy())
+                #sim_log_qvel.append(mj_data.qvel.copy())
+
+                if record_video and mj_data.time >= next_capture_time:
+                    renderer.update_scene(mj_data, cam)
+                    scene = renderer.scene
+
+                    if scene.ngeom < scene.maxgeom:
+                        mujoco.mjv_initGeom(
+                            scene.geoms[scene.ngeom],
+                            type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                            size=[0.3, 0, 0],
+                            pos=[4.0, 3.0, 0.0],
+                            mat=np.eye(3).flatten(),
+                            rgba=[0, 1, 0, 1],
+                        )
+                        scene.ngeom += 1
+
+                    if show_traces:
+                        for k in range(len(controller.task.trace_site_ids)):
+                            for r in range(num_traces):
+                                for j in range(controller.ctrl_steps):
+                                    if scene.ngeom >= scene.maxgeom:
+                                        break
+                                    idx = scene.ngeom
+                                    mujoco.mjv_initGeom(
+                                        scene.geoms[idx],
+                                        type=mujoco.mjtGeom.mjGEOM_LINE,
+                                        size=np.zeros(3),
+                                        pos=np.zeros(3),
+                                        mat=np.eye(3).flatten(),
+                                        rgba=np.array(trace_color),
+                                    )
+                                    mujoco.mjv_connector(
+                                        scene.geoms[idx],
+                                        mujoco.mjtGeom.mjGEOM_LINE,
+                                        trace_width,
+                                        np.asarray(
+                                            rollouts.trace_sites[r, j, k]
+                                        ),
+                                        np.asarray(
+                                            rollouts.trace_sites[r, j + 1, k]
+                                        ),
+                                    )
+                                    scene.ngeom += 1
+
+                    if reference is not None:
+                        mujoco.mjv_addGeoms(
+                            mj_model, ref_data, vopt, pert, catmask, scene
+                        )
+
+                    frame = renderer.render()
+                    recorder.add_frame(frame.tobytes())
+                    next_capture_time += frame_interval
+
+            wall = time.time() - wall_start
+            print(
+                f"sim {mj_data.time:.2f}/{duration:.2f}s | "
+                f"plan {plan_time:.4f}s | wall {wall:.1f}s",
+                end="\r",
+            )
+    finally:
+        print("")
+        if record_video:
+            recorder.stop()
+
+    # Save per-step state log
+   # print("Processing simulation data...")
+   # t_data = np.array(sim_log_time)
+   # q_data = np.array(sim_log_qpos)
+   # v_data = np.array(sim_log_qvel)
+   # q_cols = [f"qpos_{i}" for i in range(q_data.shape[1])]
+   # v_cols = [f"qvel_{i}" for i in range(v_data.shape[1])]
+   # all_data = np.hstack([t_data[:, None], q_data, v_data])
+   # df = pd.DataFrame(all_data, columns=["time"] + q_cols + v_cols)
+   # df.to_excel(log_path, index=False)
+   # print(f"Data saved successfully to {os.path.abspath(log_path)}")
