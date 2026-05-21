@@ -1,0 +1,37 @@
+<mujoco model="test_carabiner_capsules">
+  <compiler angle="radian" meshdir="meshes_blender" autolimits="true"/>
+
+  <asset>
+    <mesh name="carabiner_visual" file="simplified/simplified_carabiner/simplified_carabiner.obj" scale="0.001 0.001 0.001"/>
+  </asset>
+
+  <visual>
+    <headlight ambient="0.4 0.4 0.4" diffuse="0.7 0.7 0.7" specular="0.1 0.1 0.1"/>
+  </visual>
+
+  <worldbody>
+    <light pos="0 0 1" dir="0 0 -1" diffuse="0.7 0.7 0.7"/>
+
+    <!-- Semi-transparent carabiner visual (alpha=0.35) -->
+    <geom type="mesh" mesh="carabiner_visual" rgba="0.85 0.75 0.25 0.35"
+          contype="0" conaffinity="0"/>
+
+    <!-- Capsules tracing the carabiner rod -->
+    <!-- Red: same angle, shifted outward perpendicular by ~10mm so inner surface aligns with hook inner curve -->
+    <geom type="capsule"
+          fromto="-0.00199  0.04800  0.03800  -0.00199  0.07300  0.00600"
+          size="0.01509" rgba="1 0 0 0.6" contype="0" conaffinity="0"/>
+    <!-- Green: same angle, shifted outward perpendicular by ~10mm -->
+    <geom type="capsule"
+          fromto="-0.00008  0.06900 -0.00900  -0.00008  0.05400 -0.04200"
+          size="0.01612" rgba="0 1 0 0.6" contype="0" conaffinity="0"/>
+    <!-- Blue: unchanged (lower vertical) -->
+    <geom type="capsule"
+          fromto=" 0.00000 -0.06627 -0.06293   0.00000 -0.06627 -0.00854"
+          size="0.02426" rgba="0 0 1 0.6" contype="0" conaffinity="0"/>
+    <!-- Magenta: aligned with visual mesh top, z lowered slightly -->
+    <geom type="capsule"
+          fromto="-0.01692 -0.07000  0.04400  -0.01692  0.02200  0.04400"
+          size="0.04000" rgba="1 0 1 0.6" contype="0" conaffinity="0"/>
+  </worldbody>
+</mujoco>

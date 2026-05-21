@@ -1,0 +1,28 @@
+<mujoco model="right_carabiner">
+  <compiler inertiafromgeom="auto"/>
+  <default>
+    <default class="rcar_visual">
+      <geom group="2" type="mesh" contype="0" conaffinity="0"/>
+    </default>
+    <default class="rcar_collision">
+      <geom group="3" type="capsule" mass="0" contype="2" conaffinity="2"/>
+    </default>
+  </default>
+  <asset>
+    <mesh name="rcar_visual_mesh" file="simplified/simplified_carabiner/simplified_carabiner.obj" scale="0.001 0.001 0.001"/>
+  </asset>
+  <worldbody>
+    <body name="right_carabiner" pos="0.9122125 0.606425 0.6557975" quat="0.5 0.5 -0.5 -0.5">
+      <freejoint/>
+      <inertial pos="-0.006263 -0.034070 -0.030525" mass="0.242"
+                quat="0.698782 0.129047 -0.667590 -0.222204"
+                diaginertia="4.268038e-04 6.904647e-04 1.036829e-03"/>
+      <geom mesh="rcar_visual_mesh" class="rcar_visual" rgba="0.85 0.75 0.25 1"/>
+      <!-- 4-capsule decomposition: top arc, gate-inner, spine, bottom diagonal -->
+      <geom class="rcar_collision" fromto="-0.00199  0.07200 -0.04200  -0.00199  0.07200  0.03800" size="0.01500"/>
+      <geom class="rcar_collision" fromto="-0.00199  0.05000 -0.04200  -0.00199  0.03200 -0.04200" size="0.01100"/>
+      <geom class="rcar_collision" fromto="-0.01692 -0.07000  0.05000  -0.01692  0.02200  0.05000" size="0.04000"/>
+      <geom class="rcar_collision" fromto=" 0.00000 -0.07000 -0.06000   0.00000 -0.04000 -0.01000" size="0.02400"/>
+    </body>
+  </worldbody>
+</mujoco>
