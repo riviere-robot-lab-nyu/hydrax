@@ -54,7 +54,7 @@
             <joint name="hinge_z" type="hinge" axis="0 0 1" damping="0.0"/>
             <geom type="mesh" mesh="atmos" rgba="0.75 0.75 0.75 1"
                   contype="0" conaffinity="0"/>
-            <site name="thruster_f" pos=" 0.15  0.0  0.298"
+            <site name="thruster_f" pos=" 0.15  0.0  0.486"
                   xyaxes="1 0 0  0 0 -1" size="0.025" rgba="1.0 0.4 0.2 1"/>
             <site name="thruster_b" pos="-0.15  0.0  0.298"
                   xyaxes="1 0 0  0 0  1" size="0.025" rgba="1.0 0.4 0.2 1"/>
