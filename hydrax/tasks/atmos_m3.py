@@ -48,8 +48,19 @@ from hydrax.tasks.atmos_control import (
 _F_MAX = 25.0   # N
 _T_MAX = 8.0    # N·m
 
-THRUSTER_ARM = 0.11          # metres from CoM to each thruster site
-THRUSTER_MAX = 1.5
+THRUSTER_ARM = 0.108          # metres from CoM to each thruster site
+#THRUSTER_MAX = 1.5
+# LOOK AT SYS ID. RELATION BETWEEN THRUST FORCE AND THROTTLE IS F = beta/m * u * |u|
+# beta is mass normalized thrust coefficient -> This was done so I don't have to weight M3 (lazy I know)
+# TODO: Implement quadratic scaling -> F_thruster,i = beta / m * u_i * |u_i|
+# From my tests beta = ~0.264 N/kg
+# PX4 spacecraft internally does only linear scaling, however it don't matter for us because we just need to calculate
+# Desired output force, and then clamp it.
+# NOTE: IF CHANGINg THE MOTOR THROTTLE CLIP THE VALUE OF MAX FORCE NEEDS TO BE RECALCULATED
+# CURRENTLY IT TAKES INTO ACCOUNT THE QUADRATIC DIFFERENCE. INSTEAD OF F = BETA / m * u_i * |u_i|
+# WE APPROXIMATE IT AS F_thruster,i = beta / m * (0.5*u_i) * |0.5 * u_i| = 0.25 * beta / m * u_i * |u_i|
+# THen if we approximate the relationship as linear -> F_i = beta/m * u_i but u_i is capped at 0.5u_i, we get a difference of 1/2 when comparing so beta is divided by 2.
+THRUSTER_MAX = 2.725936374416385  
 # Arm joint hard limits  (order matches qpos / ctrl indices 3:9)
 _ARM_JOINT_MIN = jnp.array([-3.05433, 0.0,     0.0,     -1.5708, -1.5708, -3.14159])
 _ARM_JOINT_MAX = jnp.array([ 3.05433, 3.14159, 2.35619,  1.5708,  1.5708,  3.14159])
@@ -57,9 +68,9 @@ _ARM_JOINT_MAX = jnp.array([ 3.05433, 3.14159, 2.35619,  1.5708,  1.5708,  3.141
 # Per-step delta limits (delta mode only)
 _ARM_DELTA_MAX = jnp.array([0.1, 0.1, 0.1, 0.1, 0.1, 0.1])
 
-_GRIPPER_OPEN   = 0.044   # m
+_GRIPPER_OPEN   = 0.05   # m
 _GRIPPER_CLOSED = 0.0     # m
-_MAX_TAU = 4*THRUSTER_MAX*THRUSTER_ARM
+_MAX_TAU = 2*THRUSTER_MAX*THRUSTER_ARM
 
 class AtmosM3(Task):
     """Planar ATMOS + WidowX AI arm task.
@@ -87,16 +98,16 @@ class AtmosM3(Task):
         state_cost: jax.Array = jnp.array([1000.0, 1000.0, 500.0, 1000.0, 1000.0, 20.0]),
         ctrl_cost: jax.Array = jnp.zeros(3),
         arm_ctrl_cost: jax.Array = jnp.zeros(6),
-        kp_vel: float = 6.55,
+        kp_vel: float = 13.767355426345377,
         kp_att: float = 2.8,
-        kp_rate: float = 10.0,
+        kp_rate: float = 3.7171859,
         ki_rate: float = 0.865,
         i_fac: float = 6.981317,
         rate_i_lim: float = 0.2,
         arm_mode: Literal["absolute", "delta"] = "absolute",
         use_robot_only: bool = False,
     ) -> None:
-        xml_name = "atmos_robot.xml" if use_robot_only else "scene.xml"
+        xml_name = "atmos_robot.xml" if use_robot_only else "wall_scene.xml"
         mj_model = mujoco.MjModel.from_xml_path(ROOT + "/models/m3/" + xml_name)
         super().__init__(mj_model, trace_sites=["body_com"])
 
@@ -127,8 +138,8 @@ class AtmosM3(Task):
         self.B = jnp.array([[0., 0., -THRUSTER_MAX, THRUSTER_MAX],
                             [THRUSTER_MAX, -THRUSTER_MAX, 0., 0.],
                             [THRUSTER_MAX*THRUSTER_ARM, THRUSTER_MAX*THRUSTER_ARM, THRUSTER_MAX*THRUSTER_ARM, THRUSTER_MAX*THRUSTER_ARM]])
-        self.B_inv = jnp.array([[0., 1., 1.],[0., -1., 1.],[-1., 0., 1.],[1., 0., 1.]])
-        #self.B_inv = jnp.linalg.pinv(self.B)
+        #self.B_inv = jnp.array([[0., 1., 1.],[0., -1., 1.],[-1., 0., 1.],[1., 0., 1.]])
+        self.B_inv = jnp.linalg.pinv(self.B)
         self.wrench_min= jnp.array([-2*THRUSTER_MAX, -2*THRUSTER_MAX, -4*THRUSTER_MAX*THRUSTER_ARM])
         self.wrench_max= jnp.array([2*THRUSTER_MAX, 2*THRUSTER_MAX, 4*THRUSTER_ARM*THRUSTER_MAX])
 
@@ -164,7 +175,7 @@ class AtmosM3(Task):
         wrench_body = wrench_body.at[0:2].set(self.kp_vel * vel_error)
         wrench_body = wrench_body.at[2].set(self.kp_rate*omega_err + integral[0])
         wrench_body = wrench_body.clip(self.wrench_min, self.wrench_max)
-        thrust = (self.B_inv @ wrench_body).clip(-1., 1.)
+        thrust = (self.B_inv @ wrench_body).clip(-.5, 0.5)
         wrench_body_real = self.B @ thrust
         wrench_world = body_wrench_to_world_ctrl(wrench_body_real, yaw)
 
@@ -225,15 +236,15 @@ class AtmosM3(Task):
             state.qvel[:3] - self.goal[3:],
         ])
 
-    #def running_cost(self, state: mjx.Data, control: jax.Array) -> jax.Array:
-        #return self._circle_cost(state) + 0.1*jnp.sum(jnp.square(control[:3])) + jnp.sum(self.R_arm * jnp.square(control[3:9])) + 100*jnp.sum(jnp.square(state.qpos[3:9]))
     def running_cost(self, state: mjx.Data, control: jax.Array) -> jax.Array:
-        err = self._base_state_err(state)
-        base_state = jnp.sum(self.Q   * jnp.square(err))
-        base_ctrl  = jnp.sum(self.R   * jnp.square(control[:3]))
-        arm_ctrl   = jnp.sum(self.R_arm * jnp.square(control[3:9]))
-        arm_ctrl = arm_ctrl + jnp.sum(jnp.square(100. * state.qpos[3:9]))
-        return base_state + base_ctrl + arm_ctrl
+        return self._circle_cost(state) + 0.1*jnp.sum(jnp.square(control[:3])) + jnp.sum(self.R_arm * jnp.square(control[3:9])) + 100*jnp.sum(jnp.square(state.qpos[3:9]))
+   # def running_cost(self, state: mjx.Data, control: jax.Array) -> jax.Array:
+   #     err = self._base_state_err(state)
+   #     base_state = jnp.sum(self.Q   * jnp.square(err))
+   #     base_ctrl  = jnp.sum(self.R   * jnp.square(control[:3]))
+   #     arm_ctrl   = jnp.sum(self.R_arm * jnp.square(control[3:9]))
+   #     arm_ctrl = arm_ctrl + jnp.sum(jnp.square(100. * state.qpos[3:9]))
+   #     return base_state + base_ctrl + arm_ctrl
     
     def _circle_cost(self, state: mjx.Data, radius: float=5.0, period: float = 45.0) -> jax.Array:
         B = 2*jnp.pi/period
@@ -245,5 +256,5 @@ class AtmosM3(Task):
         
 
     def terminal_cost(self, state: mjx.Data) -> jax.Array:
-        return 10.0 * jnp.sum(self.Q * jnp.square(self._base_state_err(state))) * self.dt
-        #return 10*self._circle_cost(state)
+        #return 10.0 * jnp.sum(self.Q * jnp.square(self._base_state_err(state))) * self.dt
+        return 10*self._circle_cost(state)

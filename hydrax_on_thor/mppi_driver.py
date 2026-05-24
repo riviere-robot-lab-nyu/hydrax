@@ -80,8 +80,8 @@ class MPPIDriver(Node):
         self.declare_parameter("max_linear_accel", 2.0)    # m/s^2
         self.declare_parameter("max_angular_accel", 4.0)   # rad/s^2
         # Hard saturation (defense in depth on top of planner u_min/u_max)
-        self.declare_parameter("max_linear_vel", 1.5)      # m/s
-        self.declare_parameter("max_angular_vel", 1.5)     # rad/s
+        self.declare_parameter("max_linear_vel", 0.3)      # m/s
+        self.declare_parameter("max_angular_vel", 0.4)     # rad/s
         # Arm joint limits (placeholder — set per-joint values for real robot)
         self.declare_parameter("max_arm_pos", 3.14)
         self.declare_parameter("min_arm_pos", -3.14)

@@ -1,0 +1,49 @@
+<mujoco model="atmos_m3">
+    <!--
+        Scene file. The robot is defined in atmos_robot.xml — edit that file
+        to change joints, actuators, inertia, etc.  This file only contains
+        scene dressing (ground, lights, camera) and option overrides.
+    -->
+    <compiler angle="radian" meshdir="meshes" texturedir="meshes" autolimits="true" eulerseq="ZYX"/>
+
+    <!-- Pull in the complete robot definition -->
+    <include file="atmos_robot.xml"/>
+
+    <!-- Free-floating carabiners (4-capsule decomposition collision) -->
+    <include file="meshes_blender/simplified/simplified_carabiner/left_carabiner.xml"/>
+    <include file="meshes_blender/simplified/simplified_carabiner/right_carabiner.xml"/>
+
+    <asset>
+        <texture name="grid" type="2d" builtin="checker"
+                 rgb1="0.15 0.25 0.35" rgb2="0.25 0.35 0.45"
+                 width="512" height="512" mark="cross" markrgb="0.6 0.7 0.8"/>
+        <material name="grid" texture="grid" texrepeat="5 5" reflectance="0.15"/>
+    </asset>
+
+    <visual>
+        <headlight ambient="0.3 0.3 0.3" diffuse="0.6 0.6 0.6" specular="0.1 0.1 0.1"/>
+        <map shadowclip="1"/>
+    </visual>
+
+    <worldbody>
+        <light name="key"  pos=" 0  -4  6" dir="0  0.5 -1"
+               diffuse="0.8 0.8 0.8" specular="0.3 0.3 0.3" castshadow="true"/>
+        <light name="fill" pos=" 3   2  4" dir="-0.5 -0.3 -1"
+               diffuse="0.35 0.35 0.35" specular="0.0 0.0 0.0"/>
+        <light name="back" pos="-1   4  3" dir="0.2 -0.6 -0.5"
+               diffuse="0.2 0.2 0.2" specular="0.0 0.0 0.0"/>
+
+        <geom name="ground" type="plane" size="10 10 0.1"
+              material="grid" contype="0" conaffinity="0"/>
+
+        <camera name="track" pos="0 -5 4" xyaxes="1 0 0 0 0.6 0.8"
+                fovy="45" mode="trackcom"/>
+
+        <!-- Three floating handle boxes (carabiner-collidable) -->
+        <body name="handles" pos="1 0 0" xyaxes="-1 0 0 0 -1 0">
+            <geom type="capsule" fromto="0.0877875 0.330675 0.6557975  0.0877875 0.882175 0.6557975" size="0.01" rgba="0 1 0 0.2" contype="4" conaffinity="2"/>
+            <geom type="capsule" fromto="0.09255 -0.8424875 0.6557975  0.09255 -0.2909875 0.6557975" size="0.01" rgba="0 1 0 0.2" contype="4" conaffinity="2"/>
+            <geom type="capsule" fromto="0.09255 -0.1932 0.5033975  0.09255 0.244 0.5033975" size="0.01" rgba="1 0 0 0.4" contype="4" conaffinity="2"/>
+        </body>
+    </worldbody>
+</mujoco>

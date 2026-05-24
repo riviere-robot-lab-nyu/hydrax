@@ -84,24 +84,29 @@ class MppiPlannerNode(Node):
         super().__init__("mppi_planner")
 
         # ── MPPI tuning parameters (overridable via ros2 args / YAML) ─────
-        self.declare_parameter("plan_rate_hz", 30.0)
-        self.declare_parameter("num_samples", 1024)
-        self.declare_parameter("plan_horizon", 0.3)
-        self.declare_parameter("num_knots", 5)
-        self.declare_parameter("temperature", 0.1)
+        self.declare_parameter("plan_rate_hz", 20.0)
+        self.declare_parameter("num_samples", 256)
+        self.declare_parameter("plan_horizon", 0.25)
+        self.declare_parameter("num_knots", 4)
+        self.declare_parameter("temperature", 0.2)
+        # If true, loads atmos_robot.xml only (skips wall_scene.xml +
+        # carabiners + handles). Quick A/B knob for diagnosing per-step
+        # cost regressions caused by added scene geometry.
+        self.declare_parameter("use_robot_only", False)
 
         plan_rate = float(self.get_parameter("plan_rate_hz").value)
         num_samples = int(self.get_parameter("num_samples").value)
         plan_horizon = float(self.get_parameter("plan_horizon").value)
         num_knots = int(self.get_parameter("num_knots").value)
         temperature = float(self.get_parameter("temperature").value)
+        use_robot_only = bool(self.get_parameter("use_robot_only").value)
 
         # Wiring is hard-coded at module top: PLAN_TOPIC, ARM_STATE_TOPIC,
         # BASE_STATE_TOPIC, ARM_JOINT_NAMES.
         self.arm_joint_names = list(ARM_JOINT_NAMES)
 
         # ── Task + controller ─────────────────────────────────────────────
-        self.task = AtmosM3()
+        self.task = AtmosM3(use_robot_only=use_robot_only)
         self.ctrl = MPPI(
             self.task,
             num_samples=num_samples,
@@ -120,6 +125,12 @@ class MppiPlannerNode(Node):
         self.nu = int(self.mj_model.nu)
         self.horizon_steps = max(int(round(plan_horizon / self.sim_dt)), 1)
 
+        # Model-default qpos. Used as the base for _assemble_state so that
+        # unfilled arm / gripper slots inherit a valid default pose instead
+        # of zero (zeroing them puts the arm in an out-of-keyframe config,
+        # which can diverge under mjx.step and feed inf -> NaN into MPPI).
+        self.qpos0 = np.asarray(self.mj_model.qpos0, dtype=np.float32)
+
         self.mjx_data = mjx.make_data(self.task.model)
         self.policy_params = self.ctrl.init_params()
         self.integral = jnp.zeros(1)
@@ -135,7 +146,7 @@ class MppiPlannerNode(Node):
         self.get_logger().info("Jitting MPPI controller...")
         t0 = _time.time()
         self.mjx_data = self.mjx_data.replace(
-            qpos=jnp.zeros(self.nq, dtype=jnp.float32),
+            qpos=jnp.asarray(self.qpos0, dtype=jnp.float32),
             qvel=jnp.zeros(self.nv, dtype=jnp.float32),
             time=jnp.array(0.0, dtype=jnp.float32),
         )
@@ -256,7 +267,11 @@ class MppiPlannerNode(Node):
     # ── Plan + publish ────────────────────────────────────────────────────
     def _assemble_state(self):
 
-        qpos = np.zeros(self.nq, dtype=np.float32)
+        # Start from the model default pose so arm/gripper qpos aren't zero
+        # (which can be an unstable configuration). Only the base slots
+        # [0:3] are overwritten from real sensor data here; once the arm
+        # is wired, the arm callback will overwrite [3:9].
+        qpos = self.qpos0.copy()
         qvel = np.zeros(self.nv, dtype=np.float32)
         #qpos[:3] = self.base_qpos
         #qpos[3:9] = self.arm_qpos

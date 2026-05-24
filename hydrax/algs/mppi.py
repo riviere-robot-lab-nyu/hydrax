@@ -398,3 +398,125 @@ class MPPI(SamplingBasedController):
         weights = jax.nn.softmax(-costs / self.temperature, axis=0)
         mean = jnp.sum(weights[:, None, None] * rollouts.knots, axis=0)
         return params.replace(mean=mean)
+
+
+class MPPI_WithCtx(MPPI):
+    """MPPI variant that threads an opaque `ctx` pytree into the cost.
+
+    Same sampling / weighting as stock MPPI. The only difference: every
+    `task.running_cost_ctx(state, control, ctx)` call inside the rollout
+    receives `ctx` (e.g. a reference trajectory, or value-network params).
+
+    `ctx` flows through optimize -> rollout_with_randomizations ->
+    eval_rollouts -> scan as a JAX pytree, so as long as its shape and dtype
+    don't change between calls, JIT does not retrace.
+    """
+
+    def optimize(
+        self,
+        state: mjx.Data,
+        params: MPPIParams,
+        integral_init: jax.Array = None,
+        ctx: Any = None,
+    ) -> Tuple[MPPIParams, Trajectory]:
+        if integral_init is None:
+            integral_init = jnp.zeros(1)
+
+        # Same time-shift as alg_base.optimize.
+        tk = params.tk
+        new_tk = (
+            jnp.linspace(0.0, self.plan_horizon, self.num_knots) + state.time
+        )
+        new_mean = self.interp_func(new_tk, tk, params.mean[None, ...])[0]
+        params = params.replace(tk=new_tk, mean=new_mean)
+
+        def _scan_body(params: MPPIParams, _: Any):
+            knots, params = self.sample_knots(params)
+            knots = jnp.clip(knots, self.task.u_min, self.task.u_max)
+            rng, dr_rng = jax.random.split(params.rng)
+            rollouts = self.rollout_with_randomizations(
+                state, new_tk, knots, dr_rng, integral_init, ctx
+            )
+            params = params.replace(rng=rng)
+            params = self.update_params(params, rollouts)
+            return params, rollouts
+
+        params, rollouts = jax.lax.scan(
+            f=_scan_body, init=params, xs=jnp.arange(self.iterations)
+        )
+        rollouts_final = jax.tree.map(lambda x: x[-1], rollouts)
+        return params, rollouts_final
+
+    def rollout_with_randomizations(
+        self,
+        state: mjx.Data,
+        tk: jax.Array,
+        knots: jax.Array,
+        rng: jax.Array,
+        integral_init: jax.Array,
+        ctx: Any,
+    ) -> Trajectory:
+        states = jax.vmap(lambda _, x: x, in_axes=(0, None))(
+            jnp.arange(self.num_randomizations), state
+        )
+        if self.num_randomizations > 1:
+            subrngs = jax.random.split(rng, self.num_randomizations)
+            randomizations = jax.vmap(self.task.domain_randomize_data)(
+                states, subrngs
+            )
+            states = states.tree_replace(randomizations)
+
+        tq = jnp.linspace(tk[0], tk[-1], self.ctrl_steps)
+        controls = self.interp_func(tq, tk, knots)
+
+        _, rollouts = jax.vmap(
+            self.eval_rollouts,
+            in_axes=(self.randomized_axes, 0, None, None, None, None),
+        )(self.model, states, controls, knots, integral_init, ctx)
+
+        costs = self.risk_strategy.combine_costs(rollouts.costs)
+        controls = rollouts.controls[0]
+        knots = rollouts.knots[0]
+        trace_sites = rollouts.trace_sites[0]
+        return rollouts.replace(
+            costs=costs, controls=controls, knots=knots, trace_sites=trace_sites
+        )
+
+    @partial(jax.vmap, in_axes=(None, None, None, 0, 0, None, None))
+    def eval_rollouts(
+        self,
+        model: mjx.Model,
+        state: mjx.Data,
+        controls: jax.Array,
+        knots: jax.Array,
+        integral_init: jax.Array,
+        ctx: Any,
+    ) -> Tuple[mjx.Data, Trajectory]:
+        def _scan_fn(carry, u):
+            x, integral = carry
+            actual_ctrl = self.task.ctrl_transform_with_integral(x, u, integral)
+            integral = self.task.update_integral(x, u, integral, actual_ctrl)
+            x = x.replace(ctrl=actual_ctrl)
+            x = mjx.step(model, x)
+            cost = self.dt * self.task.running_cost_ctx(x, u, ctx)
+            sites = self.task.get_trace_sites(x)
+            return (x, integral), (x, cost, sites)
+
+        (final_state, _), (states, costs, trace_sites) = jax.lax.scan(
+            _scan_fn, (state, integral_init), controls
+        )
+        if hasattr(self.task, "terminal_cost_ctx"):
+            final_cost = self.task.terminal_cost_ctx(final_state, ctx)
+        else:
+            final_cost = self.task.terminal_cost(final_state)
+        final_trace_sites = self.task.get_trace_sites(final_state)
+
+        costs = jnp.append(costs, final_cost)
+        trace_sites = jnp.append(trace_sites, final_trace_sites[None], axis=0)
+
+        return states, Trajectory(
+            controls=controls,
+            knots=knots,
+            costs=costs,
+            trace_sites=trace_sites,
+        )

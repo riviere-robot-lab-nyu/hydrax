@@ -31,13 +31,13 @@ mj_model.opt.timestep = 0.005
 mj_data = mujoco.MjData(mj_model)
 
 #run_interactive(
-    #ctrl,
-    #mj_model,
-    #mj_data,
-    #frequency=50,
-    #show_traces=False,
-    #max_traces=0,
-    #record_video=False,
+#    ctrl,
+#    mj_model,
+#    mj_data,
+#    frequency=50,
+#    show_traces=False,
+#    max_traces=0,
+#    record_video=False,
 #)
 
 run_headless(
