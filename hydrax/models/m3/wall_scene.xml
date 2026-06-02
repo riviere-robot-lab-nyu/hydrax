@@ -40,10 +40,11 @@
                 fovy="45" mode="trackcom"/>
 
         <!-- Three floating handle boxes (carabiner-collidable) -->
-        <body name="handles" pos="1 0 0" xyaxes="-1 0 0 0 -1 0">
-            <geom type="capsule" fromto="0.0877875 0.330675 0.6557975  0.0877875 0.882175 0.6557975" size="0.01" rgba="0 1 0 0.2" contype="4" conaffinity="2"/>
-            <geom type="capsule" fromto="0.09255 -0.8424875 0.6557975  0.09255 -0.2909875 0.6557975" size="0.01" rgba="0 1 0 0.2" contype="4" conaffinity="2"/>
-            <geom type="capsule" fromto="0.09255 -0.1932 0.5033975  0.09255 0.244 0.5033975" size="0.01" rgba="1 0 0 0.4" contype="4" conaffinity="2"/>
+        <body name="handles" pos="0 -0.7335875 0" xyaxes="-1 0 0 0 -1 0">
+            <geom type="capsule" fromto="0.0877875 0.330675 0.6447  0.0877875 0.882175 0.6447" size="0.01" rgba="0 1 0 0.2" contype="4" conaffinity="2"/>
+            <geom type="capsule" fromto="0.09255 -0.8424875 0.6447  0.09255 -0.2909875 0.6447" size="0.01" rgba="0 1 0 0.2" contype="4" conaffinity="2"/>
+            <geom type="capsule" fromto="0.09255 -0.1932 0.50165  0.09255 0.244 0.50165" size="0.01" rgba="1 0 0 0.4" contype="4" conaffinity="2"/>
         </body>
+
     </worldbody>
 </mujoco>

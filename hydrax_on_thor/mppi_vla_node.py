@@ -45,12 +45,14 @@ from builtin_interfaces.msg import Duration
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from std_msgs.msg import Float64MultiArray
+from geometry_msgs.msg import PoseStamped
 
 from hydrax.algs import MPPI, MPPI_WithCtx
 from hydrax.tasks.atmos_m3 import AtmosM3
 from hydrax.tasks.atmos_m3_vla_track import AtmosM3VlaTrack
 from hydrax.tasks.atmos_m3_value import AtmosM3ValueShaped
 from hydrax.tasks.atmos_m3_vla_track_value import AtmosM3VlaTrackValue
+from hydrax.tasks.iql_nets import load_dataset_norm, load_iql_bundle
 
 
 CONTROL_NAMES = [
@@ -60,27 +62,61 @@ CONTROL_NAMES = [
 ]
 
 PLAN_TOPIC = "/mppi/plan"
-VLA_CHUNK_TOPIC = "/vla/chunk"
-ARM_STATE_TOPIC = "/TODO/arm/joint_states"
-BASE_STATE_TOPIC = "/TODO/base/odom"
-ARM_JOINT_NAMES = [
-    "TODO_joint_0",
-    "TODO_joint_1",
-    "TODO_joint_2",
-    "TODO_joint_3",
-    "TODO_joint_4",
-    "TODO_joint_5",
-]
+# Published by trossen_client_ros_chunk_publisher.py as a Float64MultiArray
+# of shape (N, VLA_ACTION_DIM), row-major flattened. No header timestamp and
+# no per-point time_from_start — we anchor at receive time and space samples
+# by vla_chunk_dt_s.
+VLA_CHUNK_TOPIC = "/vla/action_chunk"
+# VLA action layout: [arm_0..arm_5, gripper, vx, vy, yaw_rate].
+# MPPI ctrl layout:  [vx, vy, wz, arm_0..arm_5, gripper, dead] (see CONTROL_NAMES).
+# We re-order in _vla_cb so the seeded mean lives in MPPI/task convention.
+VLA_ACTION_DIM = 10
+# /follower/joint_state: Float64MultiArray of positions(7) + velocities(7),
+# published by trossen_client_ros_async.py from the Trossen driver.
+# Layout: [arm_0..arm_5, gripper, qd_arm_0..qd_arm_5, qd_gripper].
+ARM_STATE_TOPIC = "/follower/joint_state"
+ARM_STATE_LEN = 7  # 6 arm joints + 1 gripper
 
 ODOM_LIN_VEL_START = 10
 ODOM_ANG_VEL_START = 13
 
-LOCAL_POS_HEADING_INDEX = 14
 BASE_VEL_LIN_X_INDEX = 3
 BASE_VEL_LIN_Y_INDEX = 4
 BASE_VEL_YAW_RATE_INDEX = 15
 
+GLOBAL_POSE_TOPIC = "/global_pose"
 
+
+# Per-iql_mode w_value defaults. Calibrated from iql_smoke_test.py cost
+# spreads so that the IQL term's contribution lands in a workable band for
+# MPPI's fixed temperature (target spread/T ≈ 3–5).
+#
+# Reference spreads (smoke test, default temperature=0.2):
+#   track ≈ 0.109, v/q/adv ≈ 0.004, telescoping ≈ 0.003, logprob ≈ 244.7.
+#
+# TRACK_VALUE defaults give ~75% tracking / 25% IQL influence by setting
+# w_value * spread(iql) ≈ (1/3) * w_track * spread(track).
+W_VALUE_DEFAULTS_TRACK_VALUE = {
+    "v":           9.0,
+    "q":           9.0,
+    "advantage":   9.0,
+    "telescoping": 12.0,
+    "logprob":     0.00015,
+}
+
+# VALUE_SHAPED defaults scale the IQL term to spread ≈ 0.6 (so spread/T ≈ 3
+# at the default temperature=0.2). The pure-value mode has no tracking term,
+# so the IQL signal is the entire cost and needs a bigger scale than in the
+# blended case.
+W_VALUE_DEFAULTS_VALUE_SHAPED = {
+    "v":           150.0,
+    "q":           150.0,
+    "advantage":   150.0,
+    "telescoping": 200.0,
+    "logprob":     0.0025,
+}
+
+# L=0.16665
 class MppiVlaPlannerNode(Node):
     def __init__(self):
         super().__init__("mppi_vla_planner")
@@ -96,7 +132,18 @@ class MppiVlaPlannerNode(Node):
         self.declare_parameter("vla_tail_knots", 1)
         self.declare_parameter("vla_tail_alpha", 1.0)
         self.declare_parameter("vla_full_warmstart_on_new_chunk", True)
+        # Blend factor for full warmstart: 1.0 = hard snap mean to VLA (legacy
+        # behavior), 0.0 = ignore VLA, in-between = convex combo with the
+        # previously optimized mean. Only applied on chunk arrival, not per-tick.
+        self.declare_parameter("vla_full_warmstart_alpha", 1.0)
         self.declare_parameter("vla_max_chunk_age_s", 2.0)
+        # Time between consecutive actions inside a single chunk. The publisher
+        # is the OpenPI policy server output (~30 Hz control by default).
+        self.declare_parameter("vla_chunk_dt_s", 1.0 / 30.0)
+        # Passthrough: skip MPPI entirely; publish the VLA chunk resampled at
+        # the plan's normal query times as /mppi/plan. Used for end-to-end
+        # verification of the chunk -> driver chain without the optimizer.
+        self.declare_parameter("passthrough", False)
 
         # Cost-mode selection.
         #   "default"         : stock AtmosM3 cost. Same as mppi_ros_node.py.
@@ -117,19 +164,48 @@ class MppiVlaPlannerNode(Node):
         self.declare_parameter("vla_track_base_weights",
                                [10.0, 10.0, 5.0, 1.0, 1.0, 0.1])
         self.declare_parameter("vla_track_arm_weights",
-                               [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                               [1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
         self.declare_parameter("vla_track_ctrl_reg", 0.1)
 
-        # value_shaped-specific.
-        self.declare_parameter("value_kind", "v")          # "v" or "q"
-        self.declare_parameter("value_hidden", 256)
-        self.declare_parameter("value_out_scale", 1.0)
-        self.declare_parameter("value_ckpt_path", "")
+        # value_shaped / vla_track_value: shared IQL params. The IQL nets,
+        # obs-feature builder, and action minmax all come from a trained
+        # ikostrikov/implicit_q_learning bundle. See hydrax.tasks.iql_nets
+        # for the exact net defs / obs layout.
+        #   iql_mode = "v" | "q" | "telescoping" | "advantage" | "logprob"
+        #     v           : -V(s)      per step (dense)
+        #     q           : -min(Q1,Q2)(s,u) per step
+        #     telescoping : 0 per step; terminal = -γ^H V(s_T) (avoids
+        #                   double-counting that the dense V form bakes in)
+        #     advantage   : V(s)-min(Q1,Q2)(s,u) per step (=  -A)
+        #     logprob     : -log π(u|s) per step (proxy for advantage when
+        #                   V/Q are noisy)
+        self.declare_parameter("iql_mode", "v")
+        # Folder containing value.ckpt / critic.ckpt / actor.ckpt
+        # (e.g. .../checkpoints/step_1000000). Empty string = random init
+        # (intended only for plumbing smoke tests; cost signal will be junk).
+        self.declare_parameter("iql_ckpt_dir", "")
+        # Full path to the dataset config JSON (carries obs_mean/std and
+        # action_min/max — required for normalization to match training).
+        self.declare_parameter("iql_dataset_config_path", "")
+        # MLP hidden dims; must match the trained checkpoint.
+        # IQL mujoco_config: (256, 256).
+        self.declare_parameter("iql_hidden_dims", [256, 256])
+        # Training-time discount γ. Used by "telescoping" mode to weight the
+        # terminal value (γ^H V(s_T)).
+        self.declare_parameter("iql_gamma", 0.99)
+        # Mild ctrl regularizer on the base velocity dims, applied on top of
+        # the IQL term so the optimizer doesn't run free when V/Q is flat.
         self.declare_parameter("value_ctrl_reg", 0.1)
+        # Multiplier on the IQL term for the pure value_shaped mode. -1.0 =
+        # use the per-iql_mode default from W_VALUE_DEFAULTS_VALUE_SHAPED.
+        self.declare_parameter("value_shaped_w_value", -1.0)
 
         # vla_track_value-specific (the other two-mode params are reused).
+        # w_value=-1.0 means "use the per-iql_mode default from
+        # W_VALUE_DEFAULTS_TRACK_VALUE" (calibrated for 75% track / 25% value).
+        # Set to any non-negative value to override.
         self.declare_parameter("vla_track_value_w_track", 1.0)
-        self.declare_parameter("vla_track_value_w_value", 1.0)
+        self.declare_parameter("vla_track_value_w_value", -1.0)
 
         plan_rate = float(self.get_parameter("plan_rate_hz").value)
         num_samples = int(self.get_parameter("num_samples").value)
@@ -143,9 +219,14 @@ class MppiVlaPlannerNode(Node):
         self.vla_full_warmstart_on_new_chunk = bool(
             self.get_parameter("vla_full_warmstart_on_new_chunk").value
         )
+        self.vla_full_warmstart_alpha = float(
+            np.clip(self.get_parameter("vla_full_warmstart_alpha").value, 0.0, 1.0)
+        )
         self.vla_max_chunk_age_s = float(
             self.get_parameter("vla_max_chunk_age_s").value
         )
+        self.vla_chunk_dt = float(self.get_parameter("vla_chunk_dt_s").value)
+        self.passthrough = bool(self.get_parameter("passthrough").value)
 
         self.cost_mode = str(self.get_parameter("cost_mode").value)
         assert self.cost_mode in (
@@ -154,9 +235,7 @@ class MppiVlaPlannerNode(Node):
         # Modes that need the chunk → reference-state mjx rollout.
         self._uses_vla_track = self.cost_mode in ("vla_track", "vla_track_value")
 
-        self.arm_joint_names = list(ARM_JOINT_NAMES)
-
-        noise_level = jnp.array([0.1, 0.1, 0.1] + [0.01] * 8)
+        noise_level = jnp.array([0.05, 0.05, 0.05] + [0.005] * 8)
 
         if self.cost_mode == "default":
             self.task = AtmosM3()
@@ -177,24 +256,63 @@ class MppiVlaPlannerNode(Node):
             )
             ctrl_cls = MPPI_WithCtx
         elif self.cost_mode == "value_shaped":
+            self._iql_norm = self._load_iql_norm_or_fail()
+            iql_mode_str = str(self.get_parameter("iql_mode").value)
+            w_value_param = float(
+                self.get_parameter("value_shaped_w_value").value
+            )
+            if w_value_param < 0.0:
+                w_value_resolved = W_VALUE_DEFAULTS_VALUE_SHAPED.get(
+                    iql_mode_str, 1.0
+                )
+                self.get_logger().info(
+                    f"value_shaped_w_value=auto → "
+                    f"using per-mode default {w_value_resolved:g} for "
+                    f"iql_mode={iql_mode_str!r} (target spread/T ≈ 3)"
+                )
+            else:
+                w_value_resolved = w_value_param
+            self.w_value_resolved = w_value_resolved
             self.task = AtmosM3ValueShaped(
-                value_kind=str(self.get_parameter("value_kind").value),
-                hidden=int(self.get_parameter("value_hidden").value),
-                out_scale=float(self.get_parameter("value_out_scale").value),
+                iql_mode=iql_mode_str,
+                norm=self._iql_norm,
+                hidden_dims=tuple(int(x) for x in
+                                  self.get_parameter("iql_hidden_dims").value),
+                gamma=float(self.get_parameter("iql_gamma").value),
                 ctrl_reg=float(self.get_parameter("value_ctrl_reg").value),
+                w_value=w_value_resolved,
             )
             ctrl_cls = MPPI_WithCtx
         else:  # vla_track_value
+            self._iql_norm = self._load_iql_norm_or_fail()
+            iql_mode_str = str(self.get_parameter("iql_mode").value)
+            w_track_resolved = float(
+                self.get_parameter("vla_track_value_w_track").value
+            )
+            w_value_param = float(
+                self.get_parameter("vla_track_value_w_value").value
+            )
+            if w_value_param < 0.0:
+                w_value_resolved = W_VALUE_DEFAULTS_TRACK_VALUE.get(
+                    iql_mode_str, 1.0
+                )
+                self.get_logger().info(
+                    f"vla_track_value_w_value=auto → "
+                    f"using per-mode default {w_value_resolved:g} for "
+                    f"iql_mode={iql_mode_str!r} (target: ~75% track / 25% value)"
+                )
+            else:
+                w_value_resolved = w_value_param
+            self.w_track_resolved = w_track_resolved
+            self.w_value_resolved = w_value_resolved
             self.task = AtmosM3VlaTrackValue(
-                w_track=float(
-                    self.get_parameter("vla_track_value_w_track").value
-                ),
-                w_value=float(
-                    self.get_parameter("vla_track_value_w_value").value
-                ),
-                value_kind=str(self.get_parameter("value_kind").value),
-                hidden=int(self.get_parameter("value_hidden").value),
-                out_scale=float(self.get_parameter("value_out_scale").value),
+                w_track=w_track_resolved,
+                w_value=w_value_resolved,
+                iql_mode=iql_mode_str,
+                norm=self._iql_norm,
+                hidden_dims=tuple(int(x) for x in
+                                  self.get_parameter("iql_hidden_dims").value),
+                gamma=float(self.get_parameter("iql_gamma").value),
                 base_track_weights=jnp.asarray(
                     list(self.get_parameter("vla_track_base_weights").value),
                     dtype=jnp.float32,
@@ -264,33 +382,22 @@ class MppiVlaPlannerNode(Node):
         if self.cost_mode == "vla_track":
             self.ctx = init_vla_ctx
         elif self.cost_mode == "value_shaped":
-            self.value_ctrl_reg = float(self.get_parameter("value_ctrl_reg").value)
-            self.value_kind = str(self.get_parameter("value_kind").value)
-            ckpt = str(self.get_parameter("value_ckpt_path").value)
-            if ckpt:
-                self.ctx = self._load_value_params(ckpt)
-                self.get_logger().info(f"Loaded value-net params from {ckpt}")
-            else:
-                self.ctx = self.task.init_value_params(seed=0)
-                self.get_logger().warn(
-                    "value_shaped mode with no value_ckpt_path: using random "
-                    "MLP init. Cost signal will be ~zero (tanh of tiny inputs)."
-                )
+            # Always pass a fully-shaped IQL bundle: jit bakes the shape.
+            self.ctx = self._build_iql_ctx(strict=False)
         elif self.cost_mode == "vla_track_value":
-            # Per user choice: refuse to start with no checkpoint, so we never
-            # fly a value term initialized to random tanh-of-noise.
-            ckpt = str(self.get_parameter("value_ckpt_path").value)
-            if not ckpt:
-                raise RuntimeError(
-                    "cost_mode=vla_track_value requires value_ckpt_path. "
-                    "If you want pure tracking while V is still training, "
-                    "use cost_mode=vla_track instead."
-                )
-            value_params = self._load_value_params(ckpt)
-            self.get_logger().info(f"Loaded value-net params from {ckpt}")
-            self.ctx = (init_vla_ctx, value_params)
+            # Blend mode: refuse to start with no checkpoint, so we never
+            # fly a value term initialized to random noise. Bundle is a dict
+            # with "vla" + "value" + "critic" + "actor" keys.
+            iql_dict = self._build_iql_ctx(strict=True)
+            self.ctx = {"vla": init_vla_ctx, **iql_dict}
         else:
             self.ctx = None
+
+        # Tell the value/blend task what the rollout horizon is, so its
+        # "telescoping" mode can apply γ^H to the terminal V (no effect on
+        # other modes — γ^H is a scalar multiplier).
+        if self.cost_mode in ("value_shaped", "vla_track_value"):
+            self.task.set_horizon_steps(self.horizon_steps)
 
         self.jit_interp = jax.jit(self.ctrl.interp_func)
 
@@ -354,10 +461,12 @@ class MppiVlaPlannerNode(Node):
         self.gripper_qvel = np.zeros(2, dtype=np.float32)
 
         self.have_odom = False
-        self.have_pos = False
+        self.have_global_pose = False
+        self.have_arm = False
         self.last_base_stamp = None
         self.last_odom = None
-        self.last_local_pos = None
+        self.last_global_pose = None
+        self.last_arm = None
 
         # ── VLA chunk cache ───────────────────────────────────────────────
         # Times are stored in the node's "seconds since _t0_wall" clock so
@@ -379,25 +488,41 @@ class MppiVlaPlannerNode(Node):
             self.odom_cb, qos_profile_sensor_data,
         )
         self.create_subscription(
-            Float64MultiArray, '/px4/bridge/vehicle_local_position_v1',
-            self.local_pos_cb, qos_profile_sensor_data,
+            PoseStamped, GLOBAL_POSE_TOPIC,
+            self.global_pose_cb, qos_profile_sensor_data,
         )
         self.create_subscription(
-            JointTrajectory, vla_chunk_topic, self._vla_cb, 10,
+            Float64MultiArray, ARM_STATE_TOPIC,
+            self.arm_cb, qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            Float64MultiArray, vla_chunk_topic, self._vla_cb,
+            qos_profile_sensor_data,
         )
 
         self.plan_pub = self.create_publisher(JointTrajectory, PLAN_TOPIC, 10)
 
         self.timer = self.create_timer(1.0 / plan_rate, self._plan_and_publish)
 
+        if self.cost_mode == "vla_track_value":
+            track_value_log = (
+                f" w_track={self.w_track_resolved:g} "
+                f"w_value={self.w_value_resolved:g}"
+            )
+        elif self.cost_mode == "value_shaped":
+            track_value_log = f" w_value={self.w_value_resolved:g}"
+        else:
+            track_value_log = ""
         self.get_logger().info(
-            f"MPPI+VLA planner ready (cost_mode={self.cost_mode}). "
+            f"MPPI+VLA planner ready (cost_mode={self.cost_mode}, "
+            f"passthrough={self.passthrough}).{track_value_log} "
             f"Replanning at {plan_rate:.1f} Hz, "
             f"publishing on {PLAN_TOPIC}, horizon "
             f"{self.horizon_steps} steps ({plan_horizon:.2f}s). "
             f"VLA chunk topic: {vla_chunk_topic}, "
             f"tail_knots={self.vla_tail_knots}, tail_alpha={self.vla_tail_alpha}, "
-            f"full_warmstart_on_new_chunk={self.vla_full_warmstart_on_new_chunk}."
+            f"full_warmstart_on_new_chunk={self.vla_full_warmstart_on_new_chunk} "
+            f"(alpha={self.vla_full_warmstart_alpha:.2f})."
         )
         self.is_first_tick = True
 
@@ -406,51 +531,95 @@ class MppiVlaPlannerNode(Node):
         self.last_odom = (msg, self.get_clock().now().nanoseconds * 1e-9)
         self.have_odom = True
 
-    def local_pos_cb(self, msg: Float64MultiArray):
-        self.last_local_pos = (msg, self.get_clock().now().nanoseconds * 1e-9)
-        self.have_pos = True
+    def global_pose_cb(self, msg: PoseStamped):
+        self.last_global_pose = (msg, self.get_clock().now().nanoseconds * 1e-9)
+        self.have_global_pose = True
 
-    def _vla_cb(self, msg: JointTrajectory):
-        """Cache a VLA action chunk in the node's wall-clock frame.
-
-        We convert the chunk's (header.stamp + time_from_start) into the same
-        "seconds since _t0_wall" timeline that params.tk lives in, so later
-        resampling is a plain 1-D interp per control dim.
-        """
-        if not msg.points:
-            self.get_logger().warn("VLA chunk had no points; ignoring.")
+    def arm_cb(self, msg: Float64MultiArray):
+        # Layout from trossen_client_ros_async.py: positions(7) + velocities(7).
+        if len(msg.data) < ARM_STATE_LEN:
+            self.get_logger().warn(
+                f"Arm state msg too short ({len(msg.data)} < "
+                f"{2 * ARM_STATE_LEN}); ignoring.",
+                throttle_duration_sec=2.0,
+            )
             return
+        self.last_arm = (msg, self.get_clock().now().nanoseconds * 1e-9)
+        self.have_arm = True
+
+    def _vla_cb(self, msg: Float64MultiArray):
+        """Cache a VLA action chunk (Float64MultiArray) in the node's clock.
+
+        Wire format (see trossen_client_ros_chunk_publisher._publish_chunk):
+          data    : flattened (N, action_dim) row-major
+          layout  : MultiArrayLayout with dim[0]=N, dim[1]=action_dim
+          no header, no per-point timestamps
+
+        We anchor the chunk at the receive time and space samples by
+        self.vla_chunk_dt, then re-order channels from the VLA layout
+        [arm_0..arm_5, gripper, vx, vy, yaw_rate] into the MPPI ctrl layout
+        [vx, vy, wz, arm_0..arm_5, gripper, dead] and invert the gripper to
+        the task convention (0=closed, 1=open).
+        """
+        if not msg.data:
+            self.get_logger().warn("VLA chunk empty; ignoring.")
+            return
+
+        # Recover (N, action_dim) shape from layout if present; fall back to
+        # the publisher's documented action_dim=10 otherwise.
+        action_dim = (
+            int(msg.layout.dim[1].size)
+            if len(msg.layout.dim) >= 2 and msg.layout.dim[1].size > 0
+            else VLA_ACTION_DIM
+        )
+        total = len(msg.data)
+        if action_dim <= 0 or total % action_dim != 0:
+            self.get_logger().warn(
+                f"VLA chunk size {total} not divisible by action_dim "
+                f"{action_dim}; ignoring."
+            )
+            return
+        n_pts = total // action_dim
+        vla_chunk = np.asarray(msg.data, dtype=np.float32).reshape(
+            n_pts, action_dim
+        )
+
         # _t0_wall is established on the first plan tick. If a chunk shows up
         # before that, anchor it now so the math still works.
         if not hasattr(self, "_t0_wall"):
             self._t0_wall = self.get_clock().now().nanoseconds * 1e-9
 
-        stamp = msg.header.stamp
-        chunk_t0_node = (
-            stamp.sec + stamp.nanosec * 1e-9
-        ) - self._t0_wall
+        # Anchor at receive time (publisher has no header); space samples by
+        # the policy's control period.
+        now_node_t = self.get_clock().now().nanoseconds * 1e-9 - self._t0_wall
+        times = (
+            np.float32(now_node_t)
+            + np.arange(n_pts, dtype=np.float32) * np.float32(self.vla_chunk_dt)
+        )
 
-        n_pts = len(msg.points)
-        times = np.empty(n_pts, dtype=np.float32)
+        # Re-layout VLA -> MPPI ctrl. Guards on action_dim let us gracefully
+        # accept odd publisher outputs (arm-only, no base, etc.).
         ctrls = np.zeros((n_pts, self.nu), dtype=np.float32)
-        for i, pt in enumerate(msg.points):
-            tfs = pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9
-            times[i] = chunk_t0_node + tfs
-            vals = pt.positions
-            k = min(len(vals), self.nu)
-            ctrls[i, :k] = np.asarray(vals[:k], dtype=np.float32)
+        if action_dim >= 6:
+            ctrls[:, 3:9] = vla_chunk[:, 0:6]                    # arm joints
+        if action_dim >= 7:
+            ctrls[:, 9] = vla_chunk[:, 6]                        # gripper (VLA convention; inverted below)
+        if action_dim >= 10:
+            ctrls[:, 0] = vla_chunk[:, 7]                        # vx_body
+            ctrls[:, 1] = -vla_chunk[:, 8]                        # vy_body
+            ctrls[:, 2] = vla_chunk[:, 9]                        # yaw_rate (wz)
 
-        # Ensure strictly ascending time axis for np.interp.
-        order = np.argsort(times, kind="stable")
-        times = times[order]
-        ctrls = ctrls[order]
+        # VLA gripper convention (0=open, 1=close) -> MPPI task convention
+        # (atmos_m3.py: ctrl[9] = 0=closed, 1=open). mppi_driver re-inverts
+        # back to VLA convention before sending to the trossen helper.
+        ctrls[:, 9] = 1.0 - ctrls[:, 9]
 
         # Clip into task control bounds so the seeded mean is always feasible.
         np.clip(ctrls, self.u_min, self.u_max, out=ctrls)
 
         self.vla_times = times
         self.vla_controls = ctrls
-        self.vla_recv_node_t = self.get_clock().now().nanoseconds * 1e-9 - self._t0_wall
+        self.vla_recv_node_t = now_node_t
         self.have_vla = True
         if self.vla_full_warmstart_on_new_chunk:
             self.needs_full_warmstart = True
@@ -494,23 +663,67 @@ class MppiVlaPlannerNode(Node):
         _, ref_states = jax.lax.scan(_step, (state, integral0), controls)
         return ref_states
 
-    def _load_value_params(self, path: str):
-        """Load value-net params from a pickled flax pytree."""
-        import pickle
-        with open(path, "rb") as f:
-            return pickle.load(f)
+    def _load_iql_norm_or_fail(self) -> dict:
+        """Read the IQL dataset config JSON (obs/action normalization stats)."""
+        cfg_path = str(self.get_parameter("iql_dataset_config_path").value)
+        if not cfg_path:
+            raise RuntimeError(
+                f"cost_mode={self.cost_mode} needs iql_dataset_config_path "
+                "(the JSON with observation_mean/std and action_min/max)."
+            )
+        return load_dataset_norm(cfg_path)
+
+    def _build_iql_ctx(self, strict: bool) -> dict:
+        """Build {value, critic, actor} param dict for the IQL-backed cost.
+
+        If iql_ckpt_dir is set, loads the trained params from
+        <dir>/{value,critic,actor}.ckpt and fills any missing entries with
+        random init (so the dict always has consistent shape for JIT).
+        If strict=True, refuses to start without iql_ckpt_dir.
+        """
+        ckpt_dir = str(self.get_parameter("iql_ckpt_dir").value)
+        hidden_dims = tuple(int(x) for x in
+                            self.get_parameter("iql_hidden_dims").value)
+        # Random-init template for any missing entries — keeps the ctx
+        # pytree shape stable across configs.
+        ctx = self.task.init_iql_params(seed=0)
+        if ckpt_dir:
+            loaded = load_iql_bundle(
+                ckpt_dir,
+                action_dim=self.task.iql.action_dim,
+                obs_dim=self.task.iql.obs_dim,
+                hidden_dims=hidden_dims,
+            )
+            ctx.update(loaded)
+            self.get_logger().info(
+                f"Loaded IQL bundle from {ckpt_dir}: "
+                f"{sorted(loaded.keys())}"
+            )
+        elif strict:
+            raise RuntimeError(
+                f"cost_mode={self.cost_mode} requires iql_ckpt_dir. "
+                "If you want pure tracking while IQL is still training, "
+                "use cost_mode=vla_track instead."
+            )
+        else:
+            self.get_logger().warn(
+                "value_shaped with no iql_ckpt_dir: using random IQL params. "
+                "Cost signal will be untrained noise."
+            )
+        return ctx
 
     def _install_vla_ctx(self, new_vla_ctx) -> None:
         """Insert a fresh vla_ctx (ref_states, ref_t0, ref_dt) into self.ctx.
 
         In `vla_track` mode the ctx *is* the vla tuple; in `vla_track_value`
-        mode it's a (vla_ctx, value_params) pair and we only swap the first
-        slot. Only called from the main thread.
+        mode it's a dict with a "vla" key (plus value/critic/actor IQL
+        params) and we only swap the "vla" slot. Only called from the main
+        thread.
         """
         if self.cost_mode == "vla_track":
             self.ctx = new_vla_ctx
         else:  # vla_track_value
-            self.ctx = (new_vla_ctx, self.ctx[1])
+            self.ctx = {**self.ctx, "vla": new_vla_ctx}
 
     def _maybe_rebuild_vla_ref(self, now_t: float) -> None:
         """Kick off (or block on, the first time) a VLA-chunk → reference-state
@@ -572,23 +785,55 @@ class MppiVlaPlannerNode(Node):
     def _assemble_state(self):
         qpos = self.qpos0.copy()
         qvel = np.zeros(self.nv, dtype=np.float32)
+
+        # Base pose from /global_pose/ — assumed to be published in the same
+        # world frame the planner has historically been driven in (the working
+        # mppi_ros_node + driver setup). Read directly with no swap/offset.
+        pose_msg, _ = self.last_global_pose
+        pos = pose_msg.pose.position
+        q = pose_msg.pose.orientation
+        yaw = float(np.arctan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        ))
+
+        qpos[0] = float(pos.x) - float(0.16665*np.cos(yaw))
+        qpos[1] = float(pos.y) + float(0.16665*np.sin(yaw))
+        qpos[2] = yaw
+
+        # Base velocity: identical to the working mppi_ros_node mapping out of
+        # /px4/bridge/vehicle_odometry. Do not change without re-validating on
+        # hardware — the x/y swap matches the bridge's NED layout against the
+        # model's world axes, and the unsigned yaw-rate read is what's been
+        # flying.
         odom_msg, odom_t = self.last_odom
-        local_pos_msg, _ = self.last_local_pos
-        qpos[2] = float(local_pos_msg.data[LOCAL_POS_HEADING_INDEX] - np.pi / 2)
-        qpos[0] = float(odom_msg.data[4])
-        qpos[1] = float(odom_msg.data[3])
-        qvel[2] = float(odom_msg.data[BASE_VEL_YAW_RATE_INDEX])
         qvel[0] = float(odom_msg.data[ODOM_LIN_VEL_START + 1])
         qvel[1] = float(odom_msg.data[ODOM_LIN_VEL_START])
+        qvel[2] = float(odom_msg.data[BASE_VEL_YAW_RATE_INDEX])
+
+        # Arm + gripper: positions(7) + velocities(7) from /follower/joint_state.
+        # qpos[3:9] / qvel[3:9] = 6 arm joints; qpos[9:11] / qvel[9:11] = two
+        # carriage joints, both held at the gripper opening (their axes are
+        # mirrored so equal values open/close symmetrically).
+        arm_msg, _ = self.last_arm
+        arm_data = np.asarray(arm_msg.data, dtype=np.float32)
+        arm_pos = arm_data[:ARM_STATE_LEN]
+        arm_vel = arm_data[ARM_STATE_LEN:2 * ARM_STATE_LEN]
+        qpos[3:9] = arm_pos[:6]
+        qvel[3:9] = arm_vel[:6]
+        qpos[9] = qpos[10] = float(arm_pos[6])
+        qvel[9] = qvel[10] = float(arm_vel[6])
+
         self.last_base_stamp = RclTime(nanoseconds=int(odom_t * 1e9)).to_msg()
         return qpos, qvel
 
     # ── Plan + publish ────────────────────────────────────────────────────
     def _plan_and_publish(self):
-        if not (self.have_odom and self.have_pos and self.have_vla):
+        if not (self.have_odom and self.have_global_pose and self.have_arm and self.have_vla):
             self.get_logger().warn(
                 f"Waiting for state... odom={self.have_odom} "
-                f"pos={self.have_pos} vla={self.have_vla}",
+                f"global_pose={self.have_global_pose} arm={self.have_arm} "
+                f"vla={self.have_vla}",
                 throttle_duration_sec=2.0,
             )
             return
@@ -611,6 +856,22 @@ class MppiVlaPlannerNode(Node):
                 throttle_duration_sec=2.0,
             )
 
+        # Passthrough: bypass MPPI; publish the VLA chunk directly resampled
+        # at the plan's normal query times. If the chunk is stale we don't
+        # publish, so the driver's plan_timeout watchdog safe-stops instead of
+        # the arm tracking ancient setpoints.
+        if self.passthrough:
+            if chunk_stale:
+                return
+            tq_np = (
+                np.float32(now_t)
+                + np.arange(self.horizon_steps, dtype=np.float32) * self.sim_dt
+            )
+            us = self._vla_resample(tq_np)
+            us = np.clip(us, self.u_min, self.u_max)
+            self._publish_plan(us, frame_id="atmos_m3_vla_passthrough")
+            return
+
         self.mjx_data = self.mjx_data.replace(
             qpos=jnp.array(qpos),
             qvel=jnp.array(qvel),
@@ -626,7 +887,16 @@ class MppiVlaPlannerNode(Node):
             ).astype(np.float32) + np.float32(now_t)
             seeded = self._vla_resample(tk_pre)               # (K, nu)
             seeded = np.clip(seeded, self.u_min, self.u_max)
-            new_mean = jnp.asarray(seeded, dtype=self.policy_params.mean.dtype)
+            alpha = self.vla_full_warmstart_alpha
+            if alpha >= 1.0:
+                blended = seeded
+            else:
+                mean_np = np.array(self.policy_params.mean, dtype=np.float32)
+                blended = np.clip(
+                    alpha * seeded + (1.0 - alpha) * mean_np,
+                    self.u_min, self.u_max,
+                )
+            new_mean = jnp.asarray(blended, dtype=self.policy_params.mean.dtype)
             self.policy_params = self.policy_params.replace(mean=new_mean)
             # vla_track mode: kick off a fresh ref rollout anchored at the
             # current state. After the first chunk this runs on a worker
@@ -677,15 +947,22 @@ class MppiVlaPlannerNode(Node):
             )
         )[0]
 
+        self._publish_plan(us, frame_id="atmos_m3_mppi_vla")
+
+    def _publish_plan(self, us: np.ndarray, frame_id: str) -> None:
+        """Pack a (horizon_steps, nu) control sequence into JointTrajectory and publish.
+
+        Shared by the optimized path and the passthrough branch; frame_id is
+        the only thing that differs so consumers can tell them apart in logs.
+        """
         msg = JointTrajectory()
         msg.header.stamp = (
             self.last_base_stamp
             if self.last_base_stamp is not None
             else self.get_clock().now().to_msg()
         )
-        msg.header.frame_id = "atmos_m3_mppi_vla"
+        msg.header.frame_id = frame_id
         msg.joint_names = list(CONTROL_NAMES[: self.nu])
-
         for i in range(self.horizon_steps):
             pt = JointTrajectoryPoint()
             pt.positions = [float(x) for x in us[i]]
@@ -694,7 +971,6 @@ class MppiVlaPlannerNode(Node):
             nsec = int(round((t - sec) * 1e9))
             pt.time_from_start = Duration(sec=sec, nanosec=nsec)
             msg.points.append(pt)
-
         self.plan_pub.publish(msg)
 
 

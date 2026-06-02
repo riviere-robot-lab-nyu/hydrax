@@ -284,8 +284,8 @@ class SamplingBasedController(ABC):
         final_cost = self.task.terminal_cost(final_state)
         final_trace_sites = self.task.get_trace_sites(final_state)
 
-        costs = jnp.append(costs, final_cost)
-        trace_sites = jnp.append(trace_sites, final_trace_sites[None], axis=0)
+        costs = jnp.concatenate([costs, final_cost[None]])
+        trace_sites = jnp.concatenate([trace_sites, final_trace_sites[None]], axis=0)
 
         return states, Trajectory(
             controls=controls,

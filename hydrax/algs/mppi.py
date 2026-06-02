@@ -141,8 +141,8 @@ class MPPI_ctrl_chunk(SamplingBasedController):
         final_cost = self.task.terminal_cost(final_state)
         final_trace_sites = self.task.get_trace_sites(final_state)
 
-        costs = jnp.append(costs, final_cost)
-        trace_sites = jnp.append(trace_sites, final_trace_sites[None], axis=0)
+        costs = jnp.concatenate([costs, final_cost[None]])
+        trace_sites = jnp.concatenate([trace_sites, final_trace_sites[None]], axis=0)
 
         return states, Trajectory(
             controls=controls,
@@ -150,7 +150,7 @@ class MPPI_ctrl_chunk(SamplingBasedController):
             costs=costs,
             trace_sites=trace_sites,
         )
-    
+
     def rollout_with_randomizations(
         self,
         state: mjx.Data,
@@ -269,8 +269,8 @@ class MPPI_bangbang(SamplingBasedController):
         final_cost = self.task.terminal_cost(final_state)
         final_trace_sites = self.task.get_trace_sites(final_state)
 
-        costs = jnp.append(costs, final_cost)
-        trace_sites = jnp.append(trace_sites, final_trace_sites[None], axis= 0)
+        costs = jnp.concatenate([costs, final_cost[None]])
+        trace_sites = jnp.concatenate([trace_sites, final_trace_sites[None]], axis=0)
 
         return states, Trajectory(
             controls=controls,
@@ -477,9 +477,8 @@ class MPPI_WithCtx(MPPI):
         costs = self.risk_strategy.combine_costs(rollouts.costs)
         controls = rollouts.controls[0]
         knots = rollouts.knots[0]
-        trace_sites = rollouts.trace_sites[0]
         return rollouts.replace(
-            costs=costs, controls=controls, knots=knots, trace_sites=trace_sites
+            costs=costs, controls=controls, knots=knots,
         )
 
     @partial(jax.vmap, in_axes=(None, None, None, 0, 0, None, None))
@@ -492,29 +491,51 @@ class MPPI_WithCtx(MPPI):
         integral_init: jax.Array,
         ctx: Any,
     ) -> Tuple[mjx.Data, Trajectory]:
-        def _scan_fn(carry, u):
-            x, integral = carry
-            actual_ctrl = self.task.ctrl_transform_with_integral(x, u, integral)
-            integral = self.task.update_integral(x, u, integral, actual_ctrl)
-            x = x.replace(ctrl=actual_ctrl)
-            x = mjx.step(model, x)
-            cost = self.dt * self.task.running_cost_ctx(x, u, ctx)
-            sites = self.task.get_trace_sites(x)
-            return (x, integral), (x, cost, sites)
+        # Real-time path: trace_sites are not consumed by the planner, so we
+        # skip per-step site gathers and the trace-stack output entirely.
+        # The full mjx.Data state stack is only materialized when the task
+        # provides running_cost_batch_ctx (single batched cost call after the
+        # scan); otherwise we drop it so XLA doesn't carry every step's state.
+        use_batched_cost = hasattr(self.task, "running_cost_batch_ctx")
 
-        (final_state, _), (states, costs, trace_sites) = jax.lax.scan(
-            _scan_fn, (state, integral_init), controls
-        )
+        if use_batched_cost:
+            def _scan_fn(carry, u):
+                x, integral = carry
+                actual_ctrl = self.task.ctrl_transform_with_integral(x, u, integral)
+                integral = self.task.update_integral(x, u, integral, actual_ctrl)
+                x = x.replace(ctrl=actual_ctrl)
+                x = mjx.step(model, x)
+                return (x, integral), x
+
+            (final_state, _), states = jax.lax.scan(
+                _scan_fn, (state, integral_init), controls
+            )
+            costs = self.dt * self.task.running_cost_batch_ctx(
+                states, controls, ctx
+            )
+        else:
+            def _scan_fn(carry, u):
+                x, integral = carry
+                actual_ctrl = self.task.ctrl_transform_with_integral(x, u, integral)
+                integral = self.task.update_integral(x, u, integral, actual_ctrl)
+                x = x.replace(ctrl=actual_ctrl)
+                x = mjx.step(model, x)
+                cost = self.dt * self.task.running_cost_ctx(x, u, ctx)
+                return (x, integral), cost
+
+            (final_state, _), costs = jax.lax.scan(
+                _scan_fn, (state, integral_init), controls
+            )
+
         if hasattr(self.task, "terminal_cost_ctx"):
             final_cost = self.task.terminal_cost_ctx(final_state, ctx)
         else:
             final_cost = self.task.terminal_cost(final_state)
-        final_trace_sites = self.task.get_trace_sites(final_state)
 
-        costs = jnp.append(costs, final_cost)
-        trace_sites = jnp.append(trace_sites, final_trace_sites[None], axis=0)
+        costs = jnp.concatenate([costs, final_cost[None]])
+        trace_sites = jnp.zeros((costs.shape[0], 0, 3))
 
-        return states, Trajectory(
+        return final_state, Trajectory(
             controls=controls,
             knots=knots,
             costs=costs,

@@ -7,7 +7,10 @@ to print one-line summaries of what comes back.
 Topics published:
   - /px4/bridge/vehicle_odometry        std_msgs/Float64MultiArray (25 floats)
   - /px4/bridge/vehicle_local_position_v1  std_msgs/Float64MultiArray (16 floats)
-  - /vla/chunk                          trajectory_msgs/JointTrajectory
+  - /global_pose                        geometry_msgs/PoseStamped
+  - /follower/joint_state               std_msgs/Float64MultiArray (14 floats)
+  - /vla/action_chunk                   std_msgs/Float64MultiArray (N * 10 floats)
+                                        Layout matches trossen_client_ros_chunk_publisher.
 
 Topics subscribed:
   - /mppi/plan                          trajectory_msgs/JointTrajectory
@@ -30,9 +33,9 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from builtin_interfaces.msg import Duration
-from std_msgs.msg import Float64MultiArray
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from std_msgs.msg import Float64MultiArray, MultiArrayDimension, MultiArrayLayout
+from trajectory_msgs.msg import JointTrajectory
+from geometry_msgs.msg import PoseStamped
 
 
 # Must match the indices the planners read out of the Float64MultiArray
@@ -47,9 +50,15 @@ ODOM_YAW_RATE_IDX = 15        # planner reads qvel[2] = odom[15]
 LOCAL_POS_LEN = 16
 LOCAL_POS_HEADING_IDX = 14    # planner reads qpos[2] = local_pos[14] - pi/2
 
-# 11-D control vector layout (see README §4).
-NU = 11
-VX_IDX, VY_IDX, WZ_IDX = 0, 1, 2
+# VLA action layout (matches trossen_client_ros_chunk_publisher.py / OpenPI
+# policy server output). The planner does the VLA→MPPI re-layout + gripper
+# inversion in _vla_cb, so mock_bridge publishes in VLA convention.
+VLA_ACTION_DIM = 10
+VLA_ARM_START = 0          # arm joints 0..5 at VLA[0:6]
+VLA_GRIPPER_IDX = 6        # gripper at VLA[6]  (0=open, 1=close — VLA convention)
+VLA_VX_IDX = 7             # body-frame vx
+VLA_VY_IDX = 8             # body-frame vy
+VLA_YAW_RATE_IDX = 9       # body-frame yaw rate
 
 
 class MockBridge(Node):
@@ -70,16 +79,21 @@ class MockBridge(Node):
 
         # ── VLA-side params ───────────────────────────────────────────────
         self.declare_parameter("publish_vla", True)
-        self.declare_parameter("vla_topic", "/vla/chunk")
-        self.declare_parameter("vla_pub_rate_hz", 1.5)
-        self.declare_parameter("vla_chunk_horizon_s", 2.0)
-        self.declare_parameter("vla_chunk_dt_s", 0.05)        # 20 Hz inside chunk
-        # What VLA controls to publish in each chunk:
+        self.declare_parameter("vla_topic", "/vla/action_chunk")
+        self.declare_parameter("vla_pub_rate_hz", 1.)
+        self.declare_parameter("vla_chunk_horizon_s", 2.5)
+        # 30 Hz inside-chunk spacing — matches mppi_vla_node's vla_chunk_dt_s
+        # default (1/30) and the OpenPI policy server's control period.
+        self.declare_parameter("vla_chunk_dt_s", 1.0 / 30.0)
+        # What VLA controls to publish in each chunk (VLA action layout —
+        # [arm0..5, gripper, vx, vy, yaw_rate]):
         #   "zero"             : all zeros.
         #   "constant_forward" : vx = 0.1 m/s for the entire chunk.
         #   "step"             : vx = 0 for first half, vx = 0.3 for second half.
         #   "sinusoid"         : vx = vla_sin_amp * sin(2π t / chunk_horizon).
-        #   "yaw_spin"         : wz = 0.3 rad/s constant.
+        #   "yaw_spin"         : yaw_rate = 0.3 rad/s constant.
+        #   "gripper_open"     : VLA gripper = 0.0 (means OPEN in VLA convention).
+        #   "gripper_close"    : VLA gripper = 1.0 (means CLOSE in VLA convention).
         self.declare_parameter("vla_mode", "constant_forward")
         self.declare_parameter("vla_sin_amp", 0.2)
 
@@ -114,8 +128,16 @@ class MockBridge(Node):
         )
         if self.publish_vla:
             self.vla_pub = self.create_publisher(
-                JointTrajectory, vla_topic, 10
+                Float64MultiArray, vla_topic, 10
             )
+        
+        self.global_pos_pub = self.create_publisher(
+            PoseStamped, "/global_pose", 10
+        )
+
+        self.arm_state_pub = self.create_publisher(
+            Float64MultiArray, "/follower/joint_state", 10
+        )
 
         self.create_subscription(
             JointTrajectory, plan_topic, self._plan_cb, qos_profile_sensor_data
@@ -173,30 +195,52 @@ class MockBridge(Node):
 
         odom_msg = Float64MultiArray(); odom_msg.data = odom.tolist()
         pos_msg  = Float64MultiArray(); pos_msg.data  = local_pos.tolist()
+
+        pose_msg = PoseStamped()
+        pose_msg.pose.position.x=x
+        pose_msg.pose.position.y = y
+        pose_msg.pose.position.z = yaw
+        pose_msg.pose.orientation.w=1.0
+
+        arm_msg = Float64MultiArray()
+        arm_msg.data = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
         self.odom_pub.publish(odom_msg)
         self.pos_pub.publish(pos_msg)
+        self.global_pos_pub.publish(pose_msg)
+        self.arm_state_pub.publish(arm_msg)
 
     # ── Fake VLA chunk ────────────────────────────────────────────────────
     def _vla_chunk_controls(self) -> np.ndarray:
-        """(vla_n_pts, NU) chunk of controls for the configured mode."""
-        u = np.zeros((self.vla_n_pts, NU), dtype=np.float32)
+        """(vla_n_pts, VLA_ACTION_DIM) chunk in VLA action layout.
+
+        Layout: [arm_0..arm_5, gripper, vx, vy, yaw_rate]. Gripper is in VLA
+        convention (0=open, 1=close); mppi_vla_node inverts it on receive.
+        """
+        u = np.zeros((self.vla_n_pts, VLA_ACTION_DIM), dtype=np.float32)
         if self.vla_mode == "zero":
             return u
         if self.vla_mode == "constant_forward":
-            u[:, VX_IDX] = 0.1
+            u[:, VLA_VX_IDX] = 0.1
             return u
         if self.vla_mode == "step":
             half = self.vla_n_pts // 2
-            u[half:, VX_IDX] = 0.3
+            u[half:, VLA_VX_IDX] = 0.3
             return u
         if self.vla_mode == "sinusoid":
             tau = np.arange(self.vla_n_pts) * self.vla_dt
-            u[:, VX_IDX] = self.vla_sin_amp * np.sin(
+            u[:, VLA_VX_IDX] = self.vla_sin_amp * np.sin(
                 2.0 * math.pi * tau / max(self.vla_horizon, 1e-3)
             )
             return u
         if self.vla_mode == "yaw_spin":
-            u[:, WZ_IDX] = 0.3
+            u[:, VLA_YAW_RATE_IDX] = 0.3
+            return u
+        if self.vla_mode == "gripper_open":
+            u[:, VLA_GRIPPER_IDX] = 0.0
+            return u
+        if self.vla_mode == "gripper_close":
+            u[:, VLA_GRIPPER_IDX] = 1.0
             return u
         self.get_logger().warn(
             f"Unknown vla_mode={self.vla_mode!r}; falling back to zero."
@@ -205,20 +249,15 @@ class MockBridge(Node):
 
     def _tick_vla(self):
         ctrls = self._vla_chunk_controls()
-        now = self.get_clock().now().to_msg()
-
-        msg = JointTrajectory()
-        msg.header.stamp = now
-        msg.header.frame_id = "mock_vla"
-        msg.joint_names = [f"u{i}" for i in range(NU)]
-        for i in range(self.vla_n_pts):
-            pt = JointTrajectoryPoint()
-            pt.positions = [float(x) for x in ctrls[i]]
-            t = (i + 1) * self.vla_dt
-            sec = int(t)
-            nsec = int(round((t - sec) * 1e9))
-            pt.time_from_start = Duration(sec=sec, nanosec=nsec)
-            msg.points.append(pt)
+        n, d = ctrls.shape
+        msg = Float64MultiArray()
+        msg.layout = MultiArrayLayout()
+        msg.layout.dim = [
+            MultiArrayDimension(label="chunk", size=n, stride=n * d),
+            MultiArrayDimension(label="action", size=d, stride=d),
+        ]
+        msg.layout.data_offset = 0
+        msg.data = [float(x) for x in ctrls.flatten()]
         self.vla_pub.publish(msg)
 
     # ── Plan listener ─────────────────────────────────────────────────────

@@ -42,8 +42,8 @@ class AtmosM3VlaTrack(AtmosM3):
     def __init__(
         self,
         base_track_weights: jax.Array = jnp.array([10.0, 10.0, 5.0, 1.0, 1.0, 0.1]),
-        arm_track_weights: jax.Array = jnp.zeros(6),
-        ctrl_reg: float = 0.1,
+        arm_track_weights: jax.Array = jnp.ones(6),
+        ctrl_reg: float = 1.0,
         yaw_wrap: bool = True,
         **atmos_kwargs,
     ) -> None:
